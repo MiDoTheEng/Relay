@@ -63,6 +63,8 @@ class Prefs(ctx: Context) {
 data class Peer(
     val id: String, val name: String, val host: String, val lastSeen: Long,
     val battery: Int = -1, val charging: Boolean = false,
+    /** That device's Universal Clipboard state (see RelayService.clipState). */
+    val uc: String = "",
 )
 
 /** Remembers what we last synced so a received item isn't bounced straight back. */
@@ -96,7 +98,7 @@ object Peers {
     fun all(): List<Peer> = state.value.values.sortedByDescending { it.lastSeen }
 
     @Synchronized
-    fun seen(id: String, name: String, host: String, battery: Int = -1, charging: Boolean = false) {
+    fun seen(id: String, name: String, host: String, battery: Int = -1, charging: Boolean = false, uc: String = "") {
         if (host.isEmpty()) return
         val now = System.currentTimeMillis()
         val old = state.value[id]
@@ -106,6 +108,7 @@ object Peers {
             id, name, host, now,
             if (battery >= 0) battery else old?.battery ?: -1,
             if (battery >= 0) charging else old?.charging ?: false,
+            uc.ifEmpty { old?.uc ?: "" },
         )
         state.value = map
         if (old == null || old.host != host || old.name != name || now - old.lastSeen > 60_000) save()

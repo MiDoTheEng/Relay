@@ -67,6 +67,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -508,6 +509,7 @@ private fun UniversalClipboardCard(prefs: Prefs, ctx: Context) {
             }
             else -> Text("Starting…", style = MaterialTheme.typography.bodyMedium)
         }
+        PeerSetup(ctx)
     }
 }
 
@@ -547,49 +549,81 @@ private fun ExtrasCard(prefs: Prefs, ctx: Context) {
     }
 }
 
-/** One-time setup on the device itself, through Android's Wireless debugging. */
+/** This device isn't unlocked yet: show only the step that's needed now. */
 @Composable
 private fun SelfSetup(ctx: Context) {
-    val setup by AdbSetup.state.collectAsState()
+    val tick by resumeTick.collectAsState()
+    val peers by Peers.state.collectAsState()
+    val devOn = remember(tick) { AdbSetup.isDevOptionsOn(ctx) }
+    val other = peers.values.maxByOrNull { it.lastSeen }?.name ?: "other device"
+    var asked by remember { mutableStateOf(false) }
+
     Text(
-        "Android hides what you copy from other apps. Relay can unlock this itself, once, " +
-            "using Android's built-in Wireless debugging. Takes about a minute, and it stays on after restarts and updates.",
+        "One-time unlock. Your $other does it for you over Wi-Fi, so you don't need a computer.",
         style = MaterialTheme.typography.bodyMedium
     )
-    Tip("1", "Turn on Developer options: Settings → About → tap “Build number” 7 times (on some devices it's inside Software information). Skip if already on.")
-    TextButton(onClick = {
-        try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
-    }) { Text("Open About") }
-    Tip("2", "Tap Start. In Developer options, turn on Wireless debugging (allow it on your Wi-Fi), then tap “Pair device with pairing code”.")
-    Tip("3", "Pull down the notification bar, tap “Enter pairing code” on Relay's notification and type the 6 digits. Relay does the rest and restarts.")
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = {
-            AdbSetup.begin(ctx)
-            try {
-                ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            } catch (_: Exception) {
-                Toast.makeText(ctx, "Turn on Developer options first (step 1)", Toast.LENGTH_LONG).show()
-            }
-        }) { Text(if (setup.startsWith("error")) "Try again" else "Start") }
-        if (setup != "idle" && setup != "done") TextButton(onClick = { AdbSetup.cancel(ctx) }) { Text("Cancel") }
-    }
-    val status = when {
-        setup == "waiting" -> "Waiting for the pairing code…"
-        setup == "pairing" -> "Pairing…"
-        setup == "connecting" -> "Connecting…"
-        setup == "granting" -> "Setting up…"
-        setup == "done" -> "Done ✓ Relay is restarting."
-        setup.startsWith("error:") -> setup.removePrefix("error:")
-        else -> null
-    }
-    if (status != null) {
-        Text(
-            status, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium,
-            color = if (setup.startsWith("error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+    when {
+        peers.isEmpty() -> Text(
+            "First, link your other device (open Relay on it with the same pair code).",
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error
         )
+        !devOn -> {
+            Tip("1", "Turn on Developer options: tap the button, find “Build number” and tap it 7 times. Then come back here.")
+            Button(onClick = {
+                try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
+            }) { Text("Open About") }
+        }
+        else -> {
+            Tip("1", "Tap the button. Turn on Wireless debugging, then tap “Pair device with pairing code”.")
+            Tip("2", "Leave the code on screen and type it into Relay on your $other (a notification pops up there).")
+            Button(onClick = {
+                RelayService.requestSetup(ctx)
+                asked = true
+                if (!AdbSetup.openWirelessDebugging(ctx)) {
+                    Toast.makeText(ctx, "Open Settings → Developer options → Wireless debugging", Toast.LENGTH_LONG).show()
+                }
+            }) { Text("Open Wireless debugging") }
+            if (asked) Text(
+                "Your $other is waiting for the code.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary
+            )
+        }
     }
-    Text(
-        "You can switch Wireless debugging off once it's done.",
-        style = MaterialTheme.typography.bodySmall
-    )
+}
+
+/** On this device: type in the code shown on another device to unlock it. */
+@Composable
+private fun PeerSetup(ctx: Context) {
+    val peers by Peers.state.collectAsState()
+    val states by AdbSetup.state.collectAsState()
+    val waiting = peers.values.filter { it.uc == "no_logs" || states.containsKey(it.host) }
+    waiting.forEach { p -> key(p.host) { PeerSetupRow(ctx, p, states[p.host]) } }
+}
+
+@Composable
+private fun PeerSetupRow(ctx: Context, p: Peer, st: String?) {
+    var code by remember { mutableStateOf("") }
+    HorizontalDivider()
+    Text("Unlock ${p.name}", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+    if (st == "done") {
+        Text("Done ✓ ${p.name} is restarting with Universal Clipboard on.", color = MaterialTheme.colorScheme.primary)
+    } else {
+        Text(
+            "On ${p.name}, open Relay and tap “Open Wireless debugging”, then type the 6-digit code it shows:",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = code, onValueChange = { code = it },
+                placeholder = { Text("123456") }, singleLine = true,
+                modifier = Modifier.weight(1f)
+            )
+            Button(
+                onClick = { AdbSetup.setupPeer(ctx, p.host, p.name, code) },
+                enabled = code.count { it.isDigit() } >= 6 && st?.startsWith("working") != true
+            ) { Text("Unlock") }
+        }
+        if (st != null && st.startsWith("working:")) Text(st.removePrefix("working:"), color = MaterialTheme.colorScheme.primary)
+        if (st != null && st.startsWith("error:")) Text(st.removePrefix("error:"), color = MaterialTheme.colorScheme.error)
+    }
 }

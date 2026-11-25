@@ -73,6 +73,7 @@ class RelayService : Service() {
         const val ACTION_SEND_FILES = "com.midotheeng.relay.SEND_FILES"
         const val ACTION_HELLO = "com.midotheeng.relay.HELLO"
         const val ACTION_RING = "com.midotheeng.relay.RING"
+        const val ACTION_SETUP_REQ = "com.midotheeng.relay.SETUP_REQ"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_TEXT_FILE = "textFile"
         private const val EXTRA_QUIET = "quiet"
@@ -91,6 +92,11 @@ class RelayService : Service() {
 
         fun hello(ctx: Context) {
             ContextCompat.startForegroundService(ctx, Intent(ctx, RelayService::class.java).setAction(ACTION_HELLO))
+        }
+
+        /** Ask the other device to show "type the code shown on <this device>". */
+        fun requestSetup(ctx: Context) {
+            ContextCompat.startForegroundService(ctx, Intent(ctx, RelayService::class.java).setAction(ACTION_SETUP_REQ))
         }
 
         fun ring(ctx: Context) {
@@ -161,6 +167,8 @@ class RelayService : Service() {
             }
         }
         main.post { registerClipListener() }
+        // Let the other device know when our Universal Clipboard state changes.
+        scope.launch { clipState.collect { hello() } }
         startWatcher()
     }
 
@@ -182,6 +190,11 @@ class RelayService : Service() {
             }
             ACTION_HELLO -> { hello(); startWatcher() }
             ACTION_RING -> sender.execute { doRing() }
+            ACTION_SETUP_REQ -> sender.execute {
+                deliver(quietRetry = true) { host ->
+                    Wire.send(host, header("setup_req"), ByteArrayInputStream(ByteArray(0)), 0, prefs.pairCode)
+                }
+            }
         }
         return START_STICKY
     }
@@ -450,7 +463,7 @@ class RelayService : Service() {
             val from = h.optString("from", "Other device")
             val fromId = h.optString("id")
             if (fromId.isNotEmpty() && fromId != prefs.deviceId) {
-                Peers.seen(fromId, from, inc.from.hostAddress ?: "", h.optInt("bat", -1), h.optBoolean("chg"))
+                Peers.seen(fromId, from, inc.from.hostAddress ?: "", h.optInt("bat", -1), h.optBoolean("chg"), h.optString("uc"))
             }
             try {
                 when (h.optString("type")) {
@@ -473,6 +486,10 @@ class RelayService : Service() {
                         try { getSystemService(NotificationManager::class.java).cancel(mirrorId(h.optString("key"))) } catch (_: Exception) {}
                     }
                     "ring" -> { inc.file.delete(); startRing(from) }
+                    "setup_req" -> {
+                        inc.file.delete()
+                        AdbSetup.showRequest(this, inc.from.hostAddress ?: "", from)
+                    }
                     else -> inc.file.delete()
                 }
             } catch (e: Exception) {
@@ -691,7 +708,7 @@ class RelayService : Service() {
         if (code.isEmpty() || id.isEmpty() || id == prefs.deviceId) return
         if (j.optString("tag") != Crypto.tag(code, "hello|$id|$name")) return
         val host = pk.address.hostAddress ?: return
-        Peers.seen(id, name, host, j.optInt("bat", -1), j.optBoolean("chg"))
+        Peers.seen(id, name, host, j.optInt("bat", -1), j.optBoolean("chg"), j.optString("uc"))
         if (j.optString("t") == "hello") sendUdp(helloPacket("ack") ?: return, pk.address)
     }
 
@@ -702,7 +719,7 @@ class RelayService : Service() {
         val name = prefs.deviceName
         val (bat, chg) = Util.battery(this)
         val j = JSONObject().put("t", t).put("id", id).put("name", name)
-            .put("bat", bat).put("chg", chg)
+            .put("bat", bat).put("chg", chg).put("uc", clipState.value)
             .put("tag", Crypto.tag(code, "hello|$id|$name"))
         return ("RLY1$j").toByteArray()
     }
@@ -799,7 +816,7 @@ class RelayService : Service() {
     private fun header(type: String): JSONObject {
         val (bat, chg) = Util.battery(this)
         return JSONObject().put("type", type).put("from", prefs.deviceName).put("id", prefs.deviceId)
-            .put("bat", bat).put("chg", chg)
+            .put("bat", bat).put("chg", chg).put("uc", clipState.value)
     }
 
     private fun failMessage(): String = when (lastError) {
