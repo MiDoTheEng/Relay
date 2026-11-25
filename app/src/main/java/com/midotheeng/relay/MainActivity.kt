@@ -557,6 +557,7 @@ private fun SelfSetup(ctx: Context) {
     val devOn = remember(tick) { AdbSetup.isDevOptionsOn(ctx) }
     val other = peers.values.maxByOrNull { it.lastSeen }?.name ?: "other device"
     var asked by remember { mutableStateOf(false) }
+    var skipDev by remember { mutableStateOf(false) }
 
     Text(
         "One-time unlock. Your $other does it for you over Wi-Fi, so you don't need a computer.",
@@ -567,11 +568,14 @@ private fun SelfSetup(ctx: Context) {
             "First, link your other device (open Relay on it with the same pair code).",
             style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error
         )
-        !devOn -> {
+        !devOn && !skipDev -> {
             Tip("1", "Turn on Developer options: tap the button, find “Build number” and tap it 7 times. Then come back here.")
-            Button(onClick = {
-                try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
-            }) { Text("Open About") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
+                }) { Text("Open About") }
+                TextButton(onClick = { skipDev = true }) { Text("It's already on →") }
+            }
         }
         else -> {
             Tip("1", "Tap the button. Turn on Wireless debugging, then tap “Pair device with pairing code”.")
