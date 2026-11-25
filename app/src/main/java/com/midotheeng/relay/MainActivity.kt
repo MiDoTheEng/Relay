@@ -469,10 +469,6 @@ private fun HistoryRow(item: Item, now: Long) {
     }
 }
 
-private const val ADB_CMDS =
-    "adb shell pm grant com.midotheeng.relay android.permission.READ_LOGS\n" +
-        "adb shell am force-stop com.midotheeng.relay"
-
 @Composable
 private fun UniversalClipboardCard(prefs: Prefs, ctx: Context) {
     val state by RelayService.clipState.collectAsState()
@@ -490,37 +486,7 @@ private fun UniversalClipboardCard(prefs: Prefs, ctx: Context) {
                     "Do this setup on both devices to make it work both ways.",
                 style = MaterialTheme.typography.bodyMedium
             )
-            "no_logs" -> {
-                Text(
-                    "Android blocks apps from seeing what you copy. Relay gets around it the same way KDE Connect does, " +
-                        "but it needs one permission that can only be given from a computer. Once per device; it stays after restarts and updates.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Text(
-                    "1. On this device: Settings → System → Developer options → turn on USB debugging (or Wireless debugging).\n" +
-                        "2. Connect it to a computer with Android platform-tools and run:",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth()
-                ) {
-                    SelectionContainer {
-                        Text(
-                            ADB_CMDS, fontFamily = FontFamily.Monospace,
-                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(10.dp)
-                        )
-                    }
-                }
-                OutlinedButton(onClick = {
-                    Util.copyText(ctx, ADB_CMDS)
-                    Toast.makeText(ctx, "Commands copied", Toast.LENGTH_SHORT).show()
-                }) { Text("Copy commands") }
-                Text(
-                    "3. Open Relay again. No computer? An ADB app such as Bugjaeger on your other device can run the same two commands over Wireless debugging.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
+            "no_logs" -> SelfSetup(ctx)
             "no_overlay" -> {
                 Text(
                     "Almost there: allow Relay to display over other apps. It uses an invisible 1-pixel window to read the clipboard the moment you copy.",
@@ -579,4 +545,51 @@ private fun ExtrasCard(prefs: Prefs, ctx: Context) {
             )
         }
     }
+}
+
+/** One-time setup on the device itself, through Android's Wireless debugging. */
+@Composable
+private fun SelfSetup(ctx: Context) {
+    val setup by AdbSetup.state.collectAsState()
+    Text(
+        "Android hides what you copy from other apps. Relay can unlock this itself, once, " +
+            "using Android's built-in Wireless debugging. Takes about a minute, and it stays on after restarts and updates.",
+        style = MaterialTheme.typography.bodyMedium
+    )
+    Tip("1", "Turn on Developer options: Settings → About → tap “Build number” 7 times (on some devices it's inside Software information). Skip if already on.")
+    TextButton(onClick = {
+        try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
+    }) { Text("Open About") }
+    Tip("2", "Tap Start. In Developer options, turn on Wireless debugging (allow it on your Wi-Fi), then tap “Pair device with pairing code”.")
+    Tip("3", "Pull down the notification bar, tap “Enter pairing code” on Relay's notification and type the 6 digits. Relay does the rest and restarts.")
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = {
+            AdbSetup.begin(ctx)
+            try {
+                ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (_: Exception) {
+                Toast.makeText(ctx, "Turn on Developer options first (step 1)", Toast.LENGTH_LONG).show()
+            }
+        }) { Text(if (setup.startsWith("error")) "Try again" else "Start") }
+        if (setup != "idle" && setup != "done") TextButton(onClick = { AdbSetup.cancel(ctx) }) { Text("Cancel") }
+    }
+    val status = when {
+        setup == "waiting" -> "Waiting for the pairing code…"
+        setup == "pairing" -> "Pairing…"
+        setup == "connecting" -> "Connecting…"
+        setup == "granting" -> "Setting up…"
+        setup == "done" -> "Done ✓ Relay is restarting."
+        setup.startsWith("error:") -> setup.removePrefix("error:")
+        else -> null
+    }
+    if (status != null) {
+        Text(
+            status, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium,
+            color = if (setup.startsWith("error")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+        )
+    }
+    Text(
+        "You can switch Wireless debugging off once it's done.",
+        style = MaterialTheme.typography.bodySmall
+    )
 }

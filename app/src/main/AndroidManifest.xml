@@ -99,6 +99,10 @@
         </service>
 
         <receiver
+            android:name=".PairReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".CopyReceiver"
             android:exported="false" />
     </application>

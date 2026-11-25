@@ -42,6 +42,15 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+                "META-INF/BCKEY.DSA", "META-INF/BCKEY.SF", "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE*", "META-INF/NOTICE*",
+            )
+        }
+    }
     lint {
         checkReleaseBuilds = false
         abortOnError = false
@@ -59,4 +68,8 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-core")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // On-device adb (Wireless debugging) for the one-time Universal Clipboard setup
+    implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
 }
