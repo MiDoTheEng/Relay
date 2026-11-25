@@ -71,5 +71,5 @@ dependencies {
     // On-device adb (Wireless debugging) for the one-time Universal Clipboard setup
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1")
     implementation("org.conscrypt:conscrypt-android:2.5.3")
-    implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+    implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")
 }
