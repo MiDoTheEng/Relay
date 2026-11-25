@@ -1,14 +1,22 @@
 package com.midotheeng.relay
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.media.AudioAttributes
+import android.media.AudioManager
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -19,11 +27,19 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.pm.ShortcutInfoCompat
+import androidx.core.content.pm.ShortcutManagerCompat
+import androidx.core.graphics.drawable.IconCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -39,6 +55,9 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -48,13 +67,23 @@ class RelayService : Service() {
         private const val TAG = "Relay"
         private const val NOTIF_ID = 1
         private const val PROGRESS_ID = 2
+        private const val RING_ID = 3
+            const val SHARE_CATEGORY = "com.midotheeng.relay.SHARE_TARGET"
         const val ACTION_SEND_TEXT = "com.midotheeng.relay.SEND_TEXT"
         const val ACTION_SEND_FILES = "com.midotheeng.relay.SEND_FILES"
         const val ACTION_HELLO = "com.midotheeng.relay.HELLO"
+        const val ACTION_RING = "com.midotheeng.relay.RING"
         private const val EXTRA_TEXT = "text"
         private const val EXTRA_TEXT_FILE = "textFile"
+        private const val EXTRA_QUIET = "quiet"
 
         val running = MutableStateFlow(false)
+
+        /** Universal Clipboard state: off, no_logs, no_overlay, needs_approval, active */
+        val clipState = MutableStateFlow("off")
+
+        @Volatile var instance: RelayService? = null
+            private set
 
         fun start(ctx: Context) {
             ContextCompat.startForegroundService(ctx, Intent(ctx, RelayService::class.java))
@@ -64,8 +93,13 @@ class RelayService : Service() {
             ContextCompat.startForegroundService(ctx, Intent(ctx, RelayService::class.java).setAction(ACTION_HELLO))
         }
 
-        fun sendText(ctx: Context, text: String) {
-            val i = Intent(ctx, RelayService::class.java).setAction(ACTION_SEND_TEXT)
+        fun ring(ctx: Context) {
+            ContextCompat.startForegroundService(ctx, Intent(ctx, RelayService::class.java).setAction(ACTION_RING))
+        }
+
+        fun sendText(ctx: Context, text: String, quiet: Boolean = false) {
+            if (ctx is RelayService) { ctx.sender.execute { ctx.doSendText(text, quiet) }; return }
+            val i = Intent(ctx, RelayService::class.java).setAction(ACTION_SEND_TEXT).putExtra(EXTRA_QUIET, quiet)
             if (text.length > 100_000) {
                 val f = File(ctx.cacheDir, "out-${System.nanoTime()}.txt")
                 f.writeText(text)
@@ -76,9 +110,10 @@ class RelayService : Service() {
             ContextCompat.startForegroundService(ctx, i)
         }
 
-        fun sendFiles(ctx: Context, uris: List<Uri>) {
+        fun sendFiles(ctx: Context, uris: List<Uri>, quiet: Boolean = false) {
             if (uris.isEmpty()) return
-            val i = Intent(ctx, RelayService::class.java).setAction(ACTION_SEND_FILES)
+            if (ctx is RelayService) { ctx.sender.execute { ctx.doSendFiles(uris, quiet) }; return }
+            val i = Intent(ctx, RelayService::class.java).setAction(ACTION_SEND_FILES).putExtra(EXTRA_QUIET, quiet)
             val clip = ClipData.newRawUri("files", uris[0])
             uris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
             i.clipData = clip
@@ -89,7 +124,7 @@ class RelayService : Service() {
 
     private lateinit var prefs: Prefs
     private val io = Executors.newCachedThreadPool()
-    private val sender = Executors.newSingleThreadExecutor()
+    internal val sender = Executors.newSingleThreadExecutor()
     private val sched = Executors.newSingleThreadScheduledExecutor()
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -104,6 +139,7 @@ class RelayService : Service() {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
+        instance = this
         startFg()
         running.value = true
         try {
@@ -116,38 +152,54 @@ class RelayService : Service() {
         io.execute { udpLoop() }
         registerNetwork()
         sched.scheduleWithFixedDelay({ hello() }, 1, 120, TimeUnit.SECONDS)
-        scope.launch { Peers.state.collect { updateNotif() } }
+        var lastNames = ""
+        scope.launch {
+            Peers.state.collect { map ->
+                updateNotif()
+                val names = map.values.joinToString { it.id + it.name }
+                if (names != lastNames) { lastNames = names; updateShareTargets() }
+            }
+        }
+        main.post { registerClipListener() }
+        startWatcher()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startFg()
+        val quiet = intent?.getBooleanExtra(EXTRA_QUIET, false) ?: false
         when (intent?.action) {
             ACTION_SEND_TEXT -> {
                 val path = intent.getStringExtra(EXTRA_TEXT_FILE)
                 val text = if (path != null) {
                     File(path).let { f -> f.readText().also { f.delete() } }
                 } else intent.getStringExtra(EXTRA_TEXT)
-                if (!text.isNullOrEmpty()) sender.execute { sendText(text) }
+                if (!text.isNullOrEmpty()) sender.execute { doSendText(text, quiet) }
             }
             ACTION_SEND_FILES -> {
                 val uris = mutableListOf<Uri>()
                 intent.clipData?.let { cd -> for (i in 0 until cd.itemCount) cd.getItemAt(i).uri?.let(uris::add) }
-                if (uris.isNotEmpty()) sender.execute { sendFiles(uris) }
+                if (uris.isNotEmpty()) sender.execute { doSendFiles(uris, quiet) }
             }
-            ACTION_HELLO -> hello()
+            ACTION_HELLO -> { hello(); startWatcher() }
+            ACTION_RING -> sender.execute { doRing() }
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
         alive = false
+        instance = null
         running.value = false
+        clipState.value = "off"
         try { server?.close() } catch (_: Exception) {}
         try { udp?.close() } catch (_: Exception) {}
         try { mcLock?.release() } catch (_: Exception) {}
+        try { logProc?.destroy() } catch (_: Exception) {}
+        try { overlay?.let { getSystemService(WindowManager::class.java).removeView(it) } } catch (_: Exception) {}
         try {
             netCb?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
         } catch (_: Exception) {}
+        stopRing()
         scope.cancel()
         sched.shutdownNow(); sender.shutdownNow(); io.shutdownNow()
         super.onDestroy()
@@ -155,12 +207,16 @@ class RelayService : Service() {
 
     // ---------- notification ----------
 
+    private fun peerLine(p: Peer): String =
+        if (p.battery >= 0) "${p.name} ${if (p.charging) "⚡" else "🔋"}${p.battery}%" else p.name
+
     private fun buildNotif(): Notification {
         val peers = Peers.all()
         val text = when {
             !prefs.isSetUp -> "Open Relay to finish setup"
+            clipState.value == "needs_approval" -> "Tap to switch Universal Clipboard back on"
             peers.isEmpty() -> "Looking for your other device…"
-            else -> "Linked with " + peers.joinToString { it.name }
+            else -> "Linked with " + peers.joinToString { peerLine(it) }
         }
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
@@ -171,16 +227,16 @@ class RelayService : Service() {
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             PendingIntent.FLAG_IMMUTABLE
         )
-        return NotificationCompat.Builder(this, RelayApp.CH_SERVICE)
+        val b = NotificationCompat.Builder(this, RelayApp.CH_SERVICE)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle("Relay is on")
+            .setContentTitle(if (clipState.value == "active") "Relay · Universal Clipboard on" else "Relay is on")
             .setContentText(text)
             .setOngoing(true)
             .setShowWhen(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(open)
-            .addAction(0, "Send clipboard", sendClip)
-            .build()
+        if (clipState.value != "active") b.addAction(0, "Send clipboard", sendClip)
+        return b.build()
     }
 
     private fun startFg() {
@@ -193,6 +249,171 @@ class RelayService : Service() {
     }
 
     private fun toast(msg: String) = main.post { Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show() }
+
+    /** The other devices appear as their own icons at the top of the share sheet (like AirDrop). */
+    private fun updateShareTargets() {
+        try {
+            val list = Peers.all().take(3).map { p ->
+                ShortcutInfoCompat.Builder(this, "peer_${p.id}")
+                    .setShortLabel(p.name)
+                    .setLongLabel("Send to ${p.name}")
+                    .setIcon(IconCompat.createWithResource(this, R.mipmap.ic_launcher))
+                    .setIntent(Intent(this, MainActivity::class.java).setAction(Intent.ACTION_VIEW))
+                    .setCategories(setOf(SHARE_CATEGORY))
+                    .setLongLived(true)
+                    .build()
+            }
+            ShortcutManagerCompat.setDynamicShortcuts(this, list)
+        } catch (e: Exception) {
+            Log.w(TAG, "shortcuts", e)
+        }
+    }
+
+    // ---------- Universal Clipboard ----------
+    //
+    // Android hides clipboard changes from background apps. But each time the clipboard
+    // changes, the system writes "Denying clipboard access to com.midotheeng.relay" to its
+    // log. With READ_LOGS (granted once over adb) we watch for that line, then give a
+    // 1-pixel invisible overlay window focus for a moment, which is enough to read the clip.
+
+    @Volatile private var logProc: Process? = null
+    private var overlay: View? = null
+    private var overlayLp: WindowManager.LayoutParams? = null
+    @Volatile private var grabPending = false
+    private var lastTrigger = 0L
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { }
+
+    private fun registerClipListener() {
+        try { getSystemService(ClipboardManager::class.java).addPrimaryClipChangedListener(clipListener) } catch (_: Exception) {}
+    }
+
+    private fun hasLogs() = checkSelfPermission(Manifest.permission.READ_LOGS) == PackageManager.PERMISSION_GRANTED
+
+    /** Call any time; safe to repeat. Shows the system "allow logs" prompt only if called while Relay is on screen. */
+    fun startWatcher() {
+        if (!prefs.universalClipboard || !prefs.isSetUp) { stopWatcher(); clipState.value = "off"; updateNotif(); return }
+        if (!hasLogs()) { clipState.value = "no_logs"; updateNotif(); return }
+        if (!Settings.canDrawOverlays(this)) { clipState.value = "no_overlay"; updateNotif(); return }
+        main.post { ensureOverlay() }
+        if (watcherRunning) return
+        try {
+            io.execute { runWatcher() }
+        } catch (_: Exception) {
+        }
+    }
+
+    fun stopWatcher() {
+        try { logProc?.destroy() } catch (_: Exception) {}
+        logProc = null
+    }
+
+    /** On Android 13+ log access needs a one-time "Allow" each time the watcher starts. Check we really got it. */
+    private fun canSeeSystemLogs(): Boolean = try {
+        val myPid = android.os.Process.myPid().toString()
+        val pidRe = Regex("""\(\s*(\d+)\)""")
+        val p = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "300", "-v", "brief"))
+        val lines = p.inputStream.bufferedReader().readLines()
+        p.destroy()
+        lines.any { l -> pidRe.find(l)?.groupValues?.get(1)?.let { it != myPid } ?: false }
+    } catch (_: Exception) { false }
+
+    @Volatile private var watcherRunning = false
+
+    private fun runWatcher() {
+        synchronized(this) {
+            if (watcherRunning) return
+            watcherRunning = true
+        }
+        try {
+            if (!canSeeSystemLogs()) {
+                clipState.value = "needs_approval"; updateNotif(); return
+            }
+            val ts = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+            val p = Runtime.getRuntime().exec(arrayOf("logcat", "-T", ts, "ClipboardService:E", "*:S"))
+            logProc = p
+            clipState.value = "active"
+            updateNotif()
+            p.inputStream.bufferedReader().use { r ->
+                while (alive) {
+                    val line = r.readLine() ?: break
+                    if (line.contains(packageName)) main.post { onExternalClipChange() }
+                }
+            }
+            if (alive && prefs.universalClipboard) {
+                clipState.value = "needs_approval"; updateNotif()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "watcher", e)
+        } finally {
+            logProc = null
+            watcherRunning = false
+        }
+    }
+
+    private fun ensureOverlay() {
+        if (overlay != null || !Settings.canDrawOverlays(this)) return
+        try {
+            val v = object : View(this) {
+                override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+                    super.onWindowFocusChanged(hasWindowFocus)
+                    if (hasWindowFocus) onOverlayFocused()
+                }
+            }
+            val lp = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply { gravity = Gravity.TOP or Gravity.START }
+            getSystemService(WindowManager::class.java).addView(v, lp)
+            overlay = v; overlayLp = lp
+        } catch (e: Exception) {
+            Log.w(TAG, "overlay", e)
+        }
+    }
+
+    private fun setOverlayFocusable(focusable: Boolean) {
+        val v = overlay ?: return
+        val lp = overlayLp ?: return
+        lp.flags = if (focusable) lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        else lp.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        try { getSystemService(WindowManager::class.java).updateViewLayout(v, lp) } catch (_: Exception) {}
+    }
+
+    private fun onExternalClipChange() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - Sync.lastWriteAt < 2000) return // we just wrote it ourselves
+        if (now - lastTrigger < 600) return
+        lastTrigger = now
+        ensureOverlay()
+        if (overlay == null) { launchGrabActivity(); return }
+        grabPending = true
+        setOverlayFocusable(true)
+        main.postDelayed({
+            if (grabPending) { grabPending = false; setOverlayFocusable(false); launchGrabActivity() }
+        }, 700)
+    }
+
+    private fun onOverlayFocused() {
+        if (!grabPending) return
+        grabPending = false
+        try { ClipActivity.sendClipboard(this, auto = true) } catch (e: Exception) { Log.w(TAG, "grab", e) }
+        setOverlayFocusable(false)
+    }
+
+    private fun launchGrabActivity() {
+        try {
+            startActivity(
+                Intent(this, ClipActivity::class.java).setAction(ClipActivity.ACTION_AUTO)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "grab activity", e)
+        }
+    }
 
     // ---------- receiving ----------
 
@@ -229,7 +450,7 @@ class RelayService : Service() {
             val from = h.optString("from", "Other device")
             val fromId = h.optString("id")
             if (fromId.isNotEmpty() && fromId != prefs.deviceId) {
-                Peers.seen(fromId, from, inc.from.hostAddress ?: "")
+                Peers.seen(fromId, from, inc.from.hostAddress ?: "", h.optInt("bat", -1), h.optBoolean("chg"))
             }
             try {
                 when (h.optString("type")) {
@@ -242,6 +463,16 @@ class RelayService : Service() {
                         inc.file, h.optString("name", "file"),
                         h.optString("mime", "application/octet-stream"), from
                     )
+                    "notif" -> {
+                        val text = inc.file.readText()
+                        inc.file.delete()
+                        showMirrored(h, text, from)
+                    }
+                    "notif_rm" -> {
+                        inc.file.delete()
+                        try { getSystemService(NotificationManager::class.java).cancel(mirrorId(h.optString("key"))) } catch (_: Exception) {}
+                    }
+                    "ring" -> { inc.file.delete(); startRing(from) }
                     else -> inc.file.delete()
                 }
             } catch (e: Exception) {
@@ -255,6 +486,13 @@ class RelayService : Service() {
         val item = Item(History.newId(), outgoing = false, kind = "text", text = text.take(100_000), peer = from)
         History.add(item)
         if (prefs.autoCopy) main.post { Util.copyText(this, text) }
+        if (prefs.openLinks && Util.looksLikeUrl(text)) {
+            main.post {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(text.trim())).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Exception) {}
+            }
+        }
         notifyIncoming(item, null)
     }
 
@@ -289,6 +527,8 @@ class RelayService : Service() {
                 val open = Intent(Intent.ACTION_VIEW, Uri.parse(t.trim())).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 b.addAction(0, "Open link", PendingIntent.getActivity(this, nid + 1, open, PendingIntent.FLAG_IMMUTABLE))
             }
+            // With Universal Clipboard on, text arrives constantly: keep it quiet.
+            if (clipState.value == "active") b.setSilent(true).setTimeoutAfter(60_000)
         } else {
             val uri = Uri.parse(item.uri)
             val view = PendingIntent.getActivity(this, nid, Util.viewIntent(uri, item.mime), PendingIntent.FLAG_IMMUTABLE)
@@ -306,6 +546,112 @@ class RelayService : Service() {
             }
         }
         try { getSystemService(NotificationManager::class.java).notify(nid, b.build()) } catch (_: Exception) {}
+    }
+
+    // ---------- notification mirroring ----------
+
+    private fun mirrorId(key: String) = (key.hashCode() and 0x7fffffff) % 1_000_000 + 2_000_000
+
+    private fun showMirrored(h: JSONObject, text: String, from: String) {
+        val key = h.optString("key")
+        val pkg = h.optString("pkg")
+        val app = h.optString("app", "App")
+        val title = h.optString("title")
+        val nid = mirrorId(key)
+        val launch = packageManager.getLaunchIntentForPackage(pkg) ?: Intent(this, MainActivity::class.java)
+        val b = NotificationCompat.Builder(this, RelayApp.CH_MIRROR)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setSubText("$app · $from")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setContentIntent(PendingIntent.getActivity(this, nid, launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), PendingIntent.FLAG_IMMUTABLE))
+        try { getSystemService(NotificationManager::class.java).notify(nid, b.build()) } catch (_: Exception) {}
+    }
+
+    private val recentMirror = LinkedHashMap<String, Long>()
+
+    /** Called by [MirrorListener] for each new notification on this device. */
+    fun mirror(pkg: String, app: String, key: String, title: String, text: String) {
+        if (!prefs.mirrorNotifs || !prefs.isSetUp) return
+        val sig = "$key|$title|$text"
+        synchronized(recentMirror) {
+            val now = System.currentTimeMillis()
+            recentMirror.entries.removeAll { now - it.value > 60_000 }
+            if (recentMirror.containsKey(sig)) return
+            recentMirror[sig] = now
+        }
+        sender.execute {
+            val bytes = text.toByteArray()
+            deliver(quietRetry = true) { host ->
+                Wire.send(
+                    host,
+                    header("notif").put("pkg", pkg).put("app", app).put("key", key).put("title", title),
+                    ByteArrayInputStream(bytes), bytes.size.toLong(), prefs.pairCode
+                )
+            }
+        }
+    }
+
+    fun mirrorRemoved(key: String) {
+        if (!prefs.mirrorNotifs || !prefs.isSetUp) return
+        sender.execute {
+            deliver(quietRetry = true) { host ->
+                Wire.send(host, header("notif_rm").put("key", key), ByteArrayInputStream(ByteArray(0)), 0, prefs.pairCode)
+            }
+        }
+    }
+
+    // ---------- find my device ----------
+
+    private var ringtone: Ringtone? = null
+
+    private fun startRing(from: String) = main.post {
+        stopRing()
+        try {
+            val am = getSystemService(AudioManager::class.java)
+            am.setStreamVolume(AudioManager.STREAM_ALARM, am.getStreamMaxVolume(AudioManager.STREAM_ALARM), 0)
+        } catch (_: Exception) {}
+        val uri = RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_ALARM)
+            ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+        val r = RingtoneManager.getRingtone(this, uri)
+        if (r != null) {
+            r.audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION).build()
+            if (Build.VERSION.SDK_INT >= 28) r.isLooping = true
+            r.play()
+            ringtone = r
+        }
+        main.postDelayed({ stopRing() }, 30_000)
+        val stop = PendingIntent.getBroadcast(
+            this, RING_ID, Intent(this, CopyReceiver::class.java).setAction(CopyReceiver.ACTION_STOP_RING),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        val n = NotificationCompat.Builder(this, RelayApp.CH_MIRROR)
+            .setSmallIcon(R.drawable.ic_stat)
+            .setContentTitle("$from is looking for this device")
+            .setContentText("Tap to stop the sound")
+            .setContentIntent(stop)
+            .addAction(0, "Stop", stop)
+            .setDeleteIntent(stop)
+            .build()
+        try { getSystemService(NotificationManager::class.java).notify(RING_ID, n) } catch (_: Exception) {}
+    }
+
+    fun stopRing() {
+        try { ringtone?.stop() } catch (_: Exception) {}
+        ringtone = null
+        try { getSystemService(NotificationManager::class.java).cancel(RING_ID) } catch (_: Exception) {}
+    }
+
+    private fun doRing() {
+        val reached = deliver { host ->
+            Wire.send(host, header("ring"), ByteArrayInputStream(ByteArray(0)), 0, prefs.pairCode)
+        }
+        toast(if (reached.isNotEmpty()) "Ringing ${reached.joinToString()}…" else failMessage())
     }
 
     // ---------- discovery (UDP broadcast on the local Wi-Fi) ----------
@@ -345,7 +691,7 @@ class RelayService : Service() {
         if (code.isEmpty() || id.isEmpty() || id == prefs.deviceId) return
         if (j.optString("tag") != Crypto.tag(code, "hello|$id|$name")) return
         val host = pk.address.hostAddress ?: return
-        Peers.seen(id, name, host)
+        Peers.seen(id, name, host, j.optInt("bat", -1), j.optBoolean("chg"))
         if (j.optString("t") == "hello") sendUdp(helloPacket("ack") ?: return, pk.address)
     }
 
@@ -354,7 +700,10 @@ class RelayService : Service() {
         if (code.isEmpty()) return null
         val id = prefs.deviceId
         val name = prefs.deviceName
-        val j = JSONObject().put("t", t).put("id", id).put("name", name).put("tag", Crypto.tag(code, "hello|$id|$name"))
+        val (bat, chg) = Util.battery(this)
+        val j = JSONObject().put("t", t).put("id", id).put("name", name)
+            .put("bat", bat).put("chg", chg)
+            .put("tag", Crypto.tag(code, "hello|$id|$name"))
         return ("RLY1$j").toByteArray()
     }
 
@@ -415,7 +764,7 @@ class RelayService : Service() {
         return list.distinctBy { it.host }
     }
 
-    private var lastError: Exception? = null
+    @Volatile private var lastError: Exception? = null
 
     private fun tryOnce(host: String, action: (String) -> Unit): Boolean = try {
         action(host); true
@@ -424,7 +773,7 @@ class RelayService : Service() {
     }
 
     /** Sends to every known device. Returns the names that got it. */
-    private fun deliver(action: (String) -> Unit): List<String> {
+    private fun deliver(quietRetry: Boolean = false, action: (String) -> Unit): List<String> {
         if (!prefs.isSetUp) return emptyList()
         lastError = null
         var list = targets()
@@ -440,15 +789,18 @@ class RelayService : Service() {
             if (lastError is PairMismatch) continue
             // The other device may have a new IP: ask again, then retry once.
             hello()
-            Thread.sleep(2500)
+            Thread.sleep(if (quietRetry) 1500 else 2500)
             val host = t.id?.let { Peers.state.value[it]?.host } ?: t.host
             if (tryOnce(host, action)) reached += t.name
         }
         return reached
     }
 
-    private fun header(type: String) =
-        JSONObject().put("type", type).put("from", prefs.deviceName).put("id", prefs.deviceId)
+    private fun header(type: String): JSONObject {
+        val (bat, chg) = Util.battery(this)
+        return JSONObject().put("type", type).put("from", prefs.deviceName).put("id", prefs.deviceId)
+            .put("bat", bat).put("chg", chg)
+    }
 
     private fun failMessage(): String = when (lastError) {
         is PairMismatch -> "The other device has a different pair code"
@@ -456,18 +808,18 @@ class RelayService : Service() {
         else "Couldn't reach your other device — is it on the same Wi-Fi?"
     }
 
-    private fun sendText(text: String) {
+    internal fun doSendText(text: String, quiet: Boolean) {
         val bytes = text.toByteArray(Charsets.UTF_8)
-        val reached = deliver { host ->
+        val reached = deliver(quietRetry = quiet) { host ->
             Wire.send(host, header("text"), ByteArrayInputStream(bytes), bytes.size.toLong(), prefs.pairCode)
         }
         if (reached.isNotEmpty()) {
             History.add(Item(History.newId(), outgoing = true, kind = "text", text = text.take(100_000), peer = reached.joinToString()))
-            toast("Sent to ${reached.joinToString()} ✓")
-        } else toast(failMessage())
+            if (!quiet) toast("Sent to ${reached.joinToString()} ✓")
+        } else if (!quiet) toast(failMessage())
     }
 
-    private fun sendFiles(uris: List<Uri>) {
+    internal fun doSendFiles(uris: List<Uri>, quiet: Boolean) {
         val nm = getSystemService(NotificationManager::class.java)
         var ok = 0
         var names = emptyList<String>()
@@ -490,7 +842,7 @@ class RelayService : Service() {
                     }
                 } else null
                 val size = cached?.length() ?: meta.size!!
-                val reached = deliver { host ->
+                val reached = deliver(quietRetry = quiet) { host ->
                     val input = cached?.inputStream() ?: contentResolver.openInputStream(uri)
                         ?: throw IllegalStateException("Can't open ${meta.name}")
                     input.use {
@@ -507,6 +859,7 @@ class RelayService : Service() {
             }
         }
         try { nm.cancel(PROGRESS_ID) } catch (_: Exception) {}
+        if (quiet) return
         when {
             ok == uris.size -> toast(if (ok == 1) "Sent to ${names.joinToString()} ✓" else "Sent $ok files to ${names.joinToString()} ✓")
             ok > 0 -> toast("Sent $ok of ${uris.size} files")

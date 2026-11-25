@@ -80,7 +80,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.text.font.FontFamily
+import androidx.core.app.NotificationManagerCompat
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+
+/** Bumped every time Relay comes to the screen, so permission checks refresh. */
+val resumeTick = MutableStateFlow(0)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,6 +98,13 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) { Root() }
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick.value = resumeTick.value + 1
+        // Starting the clipboard watcher while on screen lets Android show its one-time "allow logs" prompt.
+        RelayService.instance?.startWatcher()
     }
 }
 
@@ -221,6 +235,7 @@ private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item { StatusCard(running, peers.values.sortedByDescending { it.lastSeen }, now) }
+            item { UniversalClipboardCard(prefs, ctx) }
             item {
                 Section("Send") {
                     OutlinedTextField(
@@ -239,6 +254,7 @@ private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
                 }
             }
             item { HowToCard(ctx) }
+            item { ExtrasCard(prefs, ctx) }
             item { SettingsCard(prefs, ctx, onEditPairing) }
             if (history.isNotEmpty()) {
                 item {
@@ -299,13 +315,18 @@ private fun StatusCard(running: Boolean, peers: List<Peer>, now: Long) {
                         )
                     )
                     Spacer(Modifier.width(10.dp))
-                    Column {
-                        Text(p.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            p.name + if (p.battery >= 0) "  ${if (p.charging) "⚡" else "🔋"} ${p.battery}%" else "",
+                            style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium
+                        )
                         Text(
                             "${p.host} · seen " + DateUtils.getRelativeTimeSpanString(p.lastSeen, now, DateUtils.MINUTE_IN_MILLIS),
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
+                    val ctx = LocalContext.current
+                    FilledTonalButton(onClick = { RelayService.ring(ctx) }) { Text("Ring") }
                 }
             }
             val ips = Util.localIps()
@@ -319,7 +340,7 @@ private fun HowToCard(ctx: Context) {
     Section("Send without opening Relay") {
         Tip("1", "Select any text → tap “Relay” in the menu (look under ⋮ if you don't see it). It goes straight to your other device and is already copied there.")
         Tip("2", "After copying something, tap the “Send clipboard” tile in Quick Settings, or the button on Relay's notification.")
-        Tip("3", "Share any photo, video, file or link → Relay.")
+        Tip("3", "Share any photo, video, file or link → tap your other device's icon at the top of the share menu (or Relay).")
         Tip("4", "Anything that arrives is copied to the clipboard automatically — just paste. Photos are also saved to Pictures/Relay.")
         if (Build.VERSION.SDK_INT >= 33) {
             OutlinedButton(onClick = { addTile(ctx) }) { Text("Add the Quick Settings tile") }
@@ -360,7 +381,8 @@ private fun SettingsCard(prefs: Prefs, ctx: Context, onEditPairing: () -> Unit) 
     var boot by remember { mutableStateOf(prefs.startOnBoot) }
     var manual by remember { mutableStateOf(prefs.manualPeer) }
     val pm = ctx.getSystemService(PowerManager::class.java)
-    var unrestricted by remember { mutableStateOf(pm.isIgnoringBatteryOptimizations(ctx.packageName)) }
+    val tick by resumeTick.collectAsState()
+    val unrestricted = remember(tick) { pm.isIgnoringBatteryOptimizations(ctx.packageName) }
 
     Section("Settings") {
         SwitchRow("Copy received items to clipboard", autoCopy) { autoCopy = it; prefs.autoCopy = it }
@@ -379,7 +401,6 @@ private fun SettingsCard(prefs: Prefs, ctx: Context, onEditPairing: () -> Unit) 
                 } catch (_: Exception) {
                     ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
                 }
-                unrestricted = true
             }) { Text("Allow background running") }
         }
         if (Build.MANUFACTURER.equals("HUAWEI", true) || Build.MANUFACTURER.equals("HONOR", true)) {
@@ -443,6 +464,118 @@ private fun HistoryRow(item: Item, now: Long) {
                 if (item.kind == "text") item.text.orEmpty() else "📎 ${item.name}",
                 maxLines = 3, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodyMedium
+            )
+        }
+    }
+}
+
+private const val ADB_CMDS =
+    "adb shell pm grant com.midotheeng.relay android.permission.READ_LOGS\n" +
+        "adb shell am force-stop com.midotheeng.relay"
+
+@Composable
+private fun UniversalClipboardCard(prefs: Prefs, ctx: Context) {
+    val state by RelayService.clipState.collectAsState()
+    var enabled by remember { mutableStateOf(prefs.universalClipboard) }
+    Section("Universal Clipboard") {
+        SwitchRow("Copy here, paste there — automatically", enabled) {
+            enabled = it
+            prefs.universalClipboard = it
+            RelayService.instance?.startWatcher() ?: RelayService.hello(ctx)
+        }
+        if (!enabled) return@Section
+        when (state) {
+            "active" -> Text(
+                "On ✓  Copy anything on this device and it's ready to paste on your other device. " +
+                    "Do this setup on both devices to make it work both ways.",
+                style = MaterialTheme.typography.bodyMedium
+            )
+            "no_logs" -> {
+                Text(
+                    "Android blocks apps from seeing what you copy. Relay gets around it the same way KDE Connect does, " +
+                        "but it needs one permission that can only be given from a computer. Once per device; it stays after restarts and updates.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Text(
+                    "1. On this device: Settings → System → Developer options → turn on USB debugging (or Wireless debugging).\n" +
+                        "2. Connect it to a computer with Android platform-tools and run:",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = MaterialTheme.shapes.small, modifier = Modifier.fillMaxWidth()
+                ) {
+                    SelectionContainer {
+                        Text(
+                            ADB_CMDS, fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                }
+                OutlinedButton(onClick = {
+                    Util.copyText(ctx, ADB_CMDS)
+                    Toast.makeText(ctx, "Commands copied", Toast.LENGTH_SHORT).show()
+                }) { Text("Copy commands") }
+                Text(
+                    "3. Open Relay again. No computer? An ADB app such as Bugjaeger on your other device can run the same two commands over Wireless debugging.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            "no_overlay" -> {
+                Text(
+                    "Almost there: allow Relay to display over other apps. It uses an invisible 1-pixel window to read the clipboard the moment you copy.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Button(onClick = {
+                    ctx.startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}"))
+                    )
+                }) { Text("Allow display over other apps") }
+            }
+            "needs_approval" -> {
+                Text(
+                    "Tap Turn on. If Android asks “Allow Relay to access all device logs?”, choose Allow. " +
+                        "Newer Android asks again after each restart — Relay's notification will remind you.",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Button(onClick = { RelayService.instance?.startWatcher() ?: RelayService.start(ctx) }) { Text("Turn on") }
+            }
+            else -> Text("Starting…", style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+@Composable
+private fun ExtrasCard(prefs: Prefs, ctx: Context) {
+    val tick by resumeTick.collectAsState()
+    var mirror by remember { mutableStateOf(prefs.mirrorNotifs) }
+    var links by remember { mutableStateOf(prefs.openLinks) }
+    val listenerOn = remember(tick) {
+        NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
+    }
+    val overlayOn = remember(tick) { Settings.canDrawOverlays(ctx) }
+    Section("Ecosystem") {
+        SwitchRow("Show this device's notifications on the other one", mirror) {
+            mirror = it
+            prefs.mirrorNotifs = it
+            if (it && !listenerOn) ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        if (mirror && !listenerOn) {
+            Text("Give Relay notification access so it can forward them.", style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
+                Text("Allow notification access")
+            }
+        }
+        Text(
+            "Dismissing one on this device clears it on the other. Tapping it opens the same app there, if it's installed.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        HorizontalDivider()
+        SwitchRow("Open links that arrive here straight away", links) { links = it; prefs.openLinks = it }
+        if (links && !overlayOn) {
+            Text(
+                "Needs “Display over other apps” (same as Universal Clipboard), or links will only show as a notification.",
+                style = MaterialTheme.typography.bodySmall
             )
         }
     }

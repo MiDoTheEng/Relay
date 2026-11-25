@@ -19,11 +19,15 @@ import java.net.NetworkInterface
 
 object Util {
     fun copyText(ctx: Context, text: String): Boolean = try {
+        Sync.lastText = text
+        Sync.lastWriteAt = android.os.SystemClock.elapsedRealtime()
         ctx.getSystemService(ClipboardManager::class.java)
             .setPrimaryClip(ClipData.newPlainText("Relay", text)); true
     } catch (_: Exception) { false }
 
     fun copyUri(ctx: Context, uri: Uri, label: String): Boolean = try {
+        Sync.lastText = "uri:$uri"
+        Sync.lastWriteAt = android.os.SystemClock.elapsedRealtime()
         ctx.getSystemService(ClipboardManager::class.java)
             .setPrimaryClip(ClipData.newUri(ctx.contentResolver, label, uri)); true
     } catch (_: Exception) { false }
@@ -109,6 +113,11 @@ object Util {
     fun viewIntent(uri: Uri, mime: String?): Intent =
         Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime ?: "*/*")
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    fun battery(ctx: Context): Pair<Int, Boolean> = try {
+        val bm = ctx.getSystemService(android.os.BatteryManager::class.java)
+        bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) to bm.isCharging
+    } catch (_: Exception) { -1 to false }
 
     fun looksLikeUrl(t: String): Boolean {
         val s = t.trim()

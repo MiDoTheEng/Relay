@@ -21,6 +21,7 @@ class RelayApp : Application() {
     companion object {
         const val CH_SERVICE = "service"
         const val CH_IN = "incoming"
+        const val CH_MIRROR = "mirrored"
     }
 
     override fun onCreate() {
@@ -39,6 +40,11 @@ class RelayApp : Application() {
                 description = "Text and files that arrive from your other device"
             }
         )
+        nm.createNotificationChannel(
+            NotificationChannel(CH_MIRROR, "From your other device", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Notifications mirrored from your other device, and Find my device"
+            }
+        )
     }
 }
 
@@ -52,19 +58,36 @@ class ClipActivity : Activity() {
     companion object {
         const val ACTION_SEND_CLIPBOARD = "com.midotheeng.relay.SEND_CLIPBOARD"
 
-        /** Reads the clipboard (caller must have focus) and sends it. */
-        fun sendClipboard(ctx: Context) {
+        const val ACTION_AUTO = "com.midotheeng.relay.AUTO"
+
+        /**
+         * Reads the clipboard (caller must have focus) and sends it.
+         * auto = Universal Clipboard: silent, skips what we just synced, only sends text and images.
+         */
+        fun sendClipboard(ctx: Context, auto: Boolean = false) {
             val cm = ctx.getSystemService(ClipboardManager::class.java)
             val clip = try { cm.primaryClip } catch (_: Exception) { null }
             val item = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
             val uri = item?.uri
             if (uri != null && item?.text.isNullOrEmpty()) {
-                RelayService.sendFiles(ctx, listOf(uri))
+                if (auto) {
+                    val mime = try { ctx.contentResolver.getType(uri) } catch (_: Exception) { null }
+                        ?: clip?.description?.takeIf { it.mimeTypeCount > 0 }?.getMimeType(0) ?: ""
+                    if (!mime.startsWith("image/")) return
+                    if (Sync.lastText == "uri:$uri") return
+                }
+                Sync.lastText = "uri:$uri"
+                RelayService.sendFiles(ctx, listOf(uri), quiet = auto)
                 return
             }
             val t = try { item?.coerceToText(ctx)?.toString() } catch (_: Exception) { null }
-            if (t.isNullOrEmpty()) Toast.makeText(ctx, "Clipboard is empty", Toast.LENGTH_SHORT).show()
-            else RelayService.sendText(ctx, t)
+            if (t.isNullOrEmpty()) {
+                if (!auto) Toast.makeText(ctx, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                return
+            }
+            if (auto && t == Sync.lastText) return
+            Sync.lastText = t
+            RelayService.sendText(ctx, t, quiet = auto)
         }
     }
 
@@ -104,13 +127,14 @@ class ClipActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && intent?.action == ACTION_SEND_CLIPBOARD) window.decorView.post { grab() }
+        val a = intent?.action
+        if (hasFocus && (a == ACTION_SEND_CLIPBOARD || a == ACTION_AUTO)) window.decorView.post { grab() }
     }
 
     private fun grab() {
         if (handled || isFinishing) return
         handled = true
-        sendClipboard(this)
+        sendClipboard(this, auto = intent?.action == ACTION_AUTO)
         close()
     }
 
@@ -155,14 +179,46 @@ class BootReceiver : BroadcastReceiver() {
     }
 }
 
-/** "Copy" button on a received-item notification. */
+/** "Copy" button on a received-item notification, and "Stop" for Find my device. */
 class CopyReceiver : BroadcastReceiver() {
+    companion object { const val ACTION_STOP_RING = "com.midotheeng.relay.STOP_RING" }
+
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == ACTION_STOP_RING) { RelayService.instance?.stopRing(); return }
         val item = History.get(intent.getLongExtra("id", -1)) ?: return
         val ok = if (item.kind == "text") Util.copyText(context, item.text.orEmpty())
         else item.uri?.let { Util.copyUri(context, Uri.parse(it), item.name ?: "file") } ?: false
         Toast.makeText(context, if (ok) "Copied" else "Couldn't copy", Toast.LENGTH_SHORT).show()
         val nid = intent.getIntExtra("nid", 0)
         if (nid != 0) context.getSystemService(NotificationManager::class.java).cancel(nid)
+    }
+}
+
+/** Forwards this device's notifications to the other device (when turned on in Relay). */
+class MirrorListener : android.service.notification.NotificationListenerService() {
+    override fun onNotificationPosted(sbn: android.service.notification.StatusBarNotification) {
+        val svc = RelayService.instance ?: return
+        if (sbn.packageName == packageName || sbn.isOngoing) return
+        val n = sbn.notification
+        if ((n.flags and android.app.Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if (n.category in setOf(
+                android.app.Notification.CATEGORY_PROGRESS, android.app.Notification.CATEGORY_SERVICE,
+                android.app.Notification.CATEGORY_TRANSPORT, android.app.Notification.CATEGORY_SYSTEM,
+                android.app.Notification.CATEGORY_NAVIGATION, android.app.Notification.CATEGORY_STATUS,
+            )
+        ) return
+        val ex = n.extras
+        val title = ex.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString()?.takeIf { it.isNotBlank() } ?: return
+        val text = (ex.getCharSequence(android.app.Notification.EXTRA_BIG_TEXT)
+            ?: ex.getCharSequence(android.app.Notification.EXTRA_TEXT))?.toString().orEmpty()
+        val app = try {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+        } catch (_: Exception) { sbn.packageName }
+        svc.mirror(sbn.packageName, app, sbn.key, title, text)
+    }
+
+    override fun onNotificationRemoved(sbn: android.service.notification.StatusBarNotification) {
+        if (sbn.packageName == packageName) return
+        RelayService.instance?.mirrorRemoved(sbn.key)
     }
 }

@@ -37,6 +37,19 @@ class Prefs(ctx: Context) {
         get() = p.getString("manual", "") ?: ""
         set(v) = p.edit().putString("manual", v.trim()).apply()
 
+    /** Copy on one device, paste on the other (needs the one-time log permission). */
+    var universalClipboard: Boolean
+        get() = p.getBoolean("uc", true)
+        set(v) = p.edit().putBoolean("uc", v).apply()
+
+    var mirrorNotifs: Boolean
+        get() = p.getBoolean("mirror", false)
+        set(v) = p.edit().putBoolean("mirror", v).apply()
+
+    var openLinks: Boolean
+        get() = p.getBoolean("openLinks", false)
+        set(v) = p.edit().putBoolean("openLinks", v).apply()
+
     var peersJson: String
         get() = p.getString("peers", "[]") ?: "[]"
         set(v) = p.edit().putString("peers", v).apply()
@@ -47,7 +60,16 @@ class Prefs(ctx: Context) {
         if (app.resources.configuration.smallestScreenWidthDp >= 600) "Tablet" else "Phone"
 }
 
-data class Peer(val id: String, val name: String, val host: String, val lastSeen: Long)
+data class Peer(
+    val id: String, val name: String, val host: String, val lastSeen: Long,
+    val battery: Int = -1, val charging: Boolean = false,
+)
+
+/** Remembers what we last synced so a received item isn't bounced straight back. */
+object Sync {
+    @Volatile var lastText: String? = null
+    @Volatile var lastWriteAt: Long = 0L
+}
 
 /** The other devices running Relay with the same pair code. */
 object Peers {
@@ -74,13 +96,17 @@ object Peers {
     fun all(): List<Peer> = state.value.values.sortedByDescending { it.lastSeen }
 
     @Synchronized
-    fun seen(id: String, name: String, host: String) {
+    fun seen(id: String, name: String, host: String, battery: Int = -1, charging: Boolean = false) {
         if (host.isEmpty()) return
         val now = System.currentTimeMillis()
         val old = state.value[id]
         // A reinstalled device gets a new id but keeps its IP: drop stale entries on the same host.
         val map = state.value.filterValues { it.host != host || it.id == id }.toMutableMap()
-        map[id] = Peer(id, name, host, now)
+        map[id] = Peer(
+            id, name, host, now,
+            if (battery >= 0) battery else old?.battery ?: -1,
+            if (battery >= 0) charging else old?.charging ?: false,
+        )
         state.value = map
         if (old == null || old.host != host || old.name != name || now - old.lastSeen > 60_000) save()
     }
