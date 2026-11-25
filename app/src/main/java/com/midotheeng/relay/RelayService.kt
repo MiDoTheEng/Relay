@@ -157,7 +157,7 @@ class RelayService : Service() {
         io.execute { tcpLoop() }
         io.execute { udpLoop() }
         registerNetwork()
-        sched.scheduleWithFixedDelay({ hello() }, 1, 120, TimeUnit.SECONDS)
+        sched.scheduleWithFixedDelay({ hello() }, 1, 60, TimeUnit.SECONDS)
         var lastNames = ""
         scope.launch {
             Peers.state.collect { map ->
@@ -821,8 +821,8 @@ class RelayService : Service() {
 
     private fun failMessage(): String = when (lastError) {
         is PairMismatch -> "The other device has a different pair code"
-        else -> if (targets().isEmpty()) "No device found — open Relay on the other device (same Wi-Fi)"
-        else "Couldn't reach your other device — is it on the same Wi-Fi?"
+        else -> if (targets().isEmpty()) "No device found. Open Relay on the other device (same Wi-Fi)."
+        else "Can't reach ${targets().first().name}. Open Relay on it and check it's on the same Wi-Fi."
     }
 
     internal fun doSendText(text: String, quiet: Boolean) {

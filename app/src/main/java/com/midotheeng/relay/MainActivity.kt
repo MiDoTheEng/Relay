@@ -203,7 +203,7 @@ private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
     val running by RelayService.running.collectAsState()
     var draft by rememberSaveable { mutableStateOf("") }
     val now by produceState(System.currentTimeMillis()) {
-        while (true) { delay(20_000); value = System.currentTimeMillis() }
+        while (true) { delay(10_000); value = System.currentTimeMillis() }
     }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isNotEmpty()) RelayService.sendFiles(ctx, uris)
@@ -283,7 +283,8 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 
 @Composable
 private fun StatusCard(running: Boolean, peers: List<Peer>, now: Long) {
-    val linked = peers.isNotEmpty()
+    // Only "Linked" if the other device actually answered in the last 3 minutes.
+    val linked = peers.any { now - it.lastSeen < 3 * 60_000 }
     Card(
         Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -296,14 +297,15 @@ private fun StatusCard(running: Boolean, peers: List<Peer>, now: Long) {
                 when {
                     !running -> "Starting…"
                     linked -> "Linked"
+                    peers.isNotEmpty() -> "Can't reach ${peers.first().name} right now"
                     else -> "Looking for your other device…"
                 },
                 style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold
             )
             if (!linked) {
                 Text(
-                    "Open Relay on the other device once, with the same pair code and the same Wi-Fi. " +
-                        "Then tap ⟳ above.",
+                    "Open Relay on the other device (same Wi-Fi, same pair code, latest version). " +
+                        "On the Huawei tablet also allow Relay in Settings → Battery → App launch. Then tap ⟳ above.",
                     style = MaterialTheme.typography.bodyMedium
                 )
             }
