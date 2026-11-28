@@ -95,7 +95,7 @@ class ClipActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (!Prefs(this).isSetUp) {
+        if (!Prefs(this).hasName) {
             startActivity(Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             close(); return
         }
@@ -173,7 +173,7 @@ class SendTileService : TileService() {
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val p = Prefs(context)
-        if (p.isSetUp && p.startOnBoot) {
+        if (p.hasName && p.startOnBoot) {
             try { RelayService.start(context) } catch (_: Exception) {}
         }
     }

@@ -1,0 +1,203 @@
+package com.midotheeng.relay
+
+import android.accessibilityservice.AccessibilityService
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
+import android.util.Log
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+
+/**
+ * Auto clipboard sync (Accessibility permission).
+ *
+ * Android hides the clipboard from background apps. This service notices the moment you copy:
+ * you tap a "Copy" button, an app says "Copied", or Android shows its own "copied" preview.
+ * Then it gives a 1-pixel invisible window focus for a split second, which is enough
+ * to read the clipboard legally, and sends it to your other devices.
+ */
+class ClipWatchService : AccessibilityService() {
+
+    companion object {
+        private const val TAG = "RelayClip"
+
+        fun isOn(ctx: Context): Boolean {
+            val s = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: return false
+            val full = "${ctx.packageName}/${ClipWatchService::class.java.name}"
+            val short = "${ctx.packageName}/.ClipWatchService"
+            return s.split(':').any { it.equals(full, true) || it.equals(short, true) }
+        }
+
+        // Button labels that mean "copy" (several languages).
+        private val COPY_WORDS = listOf(
+            "copy", "copy text", "copy link", "copy link address", "copy message", "copy to clipboard",
+            "نسخ", "نسخ النص", "نسخ الرابط", "نسخ الرابط", "kopieren", "copier", "copiar", "copia", "kopyala", "复制", "копировать",
+        )
+
+        // Messages apps show after copying.
+        private val COPIED_WORDS = listOf(
+            "copied", "copy to clipboard", "clipboard", "تم النسخ", "نُسخ", "الحافظة", "kopiert", "copié", "copiado", "copiato",
+            "kopyalandı", "已复制", "скопировано",
+        )
+    }
+
+    private val main = Handler(Looper.getMainLooper())
+    private var lastTrigger = 0L
+    private var lastSelection: String? = null
+    private var lastSelectionAt = 0L
+    private var overlay: View? = null
+    @Volatile private var waitingForFocus = false
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        RelayService.start(this)
+    }
+
+    override fun onInterrupt() {}
+
+    override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+        e ?: return
+        if (e.packageName == packageName) return
+        try {
+            when (e.eventType) {
+                AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                    val label = labelOf(e)
+                    if (label.length <= 40 && COPY_WORDS.any { label == it || label.startsWith("$it ") || label.endsWith(" $it") }) {
+                        trigger(usedSelection = true)
+                    }
+                }
+                AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
+                    if (e.className?.toString()?.contains("Toast") == true) {
+                        val t = labelOf(e)
+                        if (COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false)
+                    }
+                }
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                    // Android 13+ shows its own clipboard preview after every copy.
+                    if (e.packageName == "com.android.systemui") {
+                        val t = labelOf(e) + " " + (e.className ?: "").toString().lowercase()
+                        if (t.contains("clipboard") || COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false)
+                    }
+                }
+                AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
+                    val text = e.text?.joinToString("") ?: return
+                    val from = minOf(e.fromIndex, e.toIndex)
+                    val to = maxOf(e.fromIndex, e.toIndex)
+                    if (from in 0 until to && to <= text.length) {
+                        lastSelection = text.substring(from, to)
+                        lastSelectionAt = SystemClock.elapsedRealtime()
+                    }
+                }
+            }
+        } catch (ex: Exception) {
+            Log.w(TAG, "event", ex)
+        }
+    }
+
+    private fun labelOf(e: AccessibilityEvent): String =
+        ((e.text?.joinToString(" ") ?: "") + " " + (e.contentDescription ?: "")).trim().lowercase()
+
+    private var triggerUsedSelection = false
+
+    private fun trigger(usedSelection: Boolean) {
+        val p = Prefs(this)
+        if (!p.autoSend || Peers.all().isEmpty()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - Sync.lastWriteAt < 2500) return // that was us pasting something we received
+        if (now - lastTrigger < 700) return
+        lastTrigger = now
+        triggerUsedSelection = usedSelection
+        // Give the app a moment to actually put the text on the clipboard.
+        main.postDelayed({ grab() }, 250)
+    }
+
+    /** Briefly takes focus with an invisible 1-pixel window so Android lets us read the clipboard. */
+    private fun grab() {
+        try {
+            val wm = getSystemService(WindowManager::class.java)
+            removeOverlay()
+            val v = object : View(this) {
+                override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+                    super.onWindowFocusChanged(hasWindowFocus)
+                    if (hasWindowFocus && waitingForFocus) {
+                        waitingForFocus = false
+                        readAndSend()
+                        main.post { removeOverlay() }
+                    }
+                }
+            }
+            val lp = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                PixelFormat.TRANSLUCENT
+            ).apply { gravity = Gravity.TOP or Gravity.START }
+            waitingForFocus = true
+            wm.addView(v, lp)
+            overlay = v
+            main.postDelayed({
+                if (waitingForFocus) {
+                    waitingForFocus = false
+                    removeOverlay()
+                    fallback()
+                }
+            }, 600)
+        } catch (ex: Exception) {
+            Log.w(TAG, "overlay", ex)
+            waitingForFocus = false
+            fallback()
+        }
+    }
+
+    private fun readAndSend() {
+        try {
+            ClipActivity.sendClipboard(this, auto = true)
+        } catch (ex: Exception) {
+            Log.w(TAG, "read", ex)
+        }
+    }
+
+    /** If the invisible window didn't get focus, use an invisible screen instead, or the selected text. */
+    private fun fallback() {
+        val sel = lastSelection
+        if (triggerUsedSelection && sel != null && SystemClock.elapsedRealtime() - lastSelectionAt < 15_000) {
+            if (sel != Sync.lastText) {
+                Sync.lastText = sel
+                RelayService.sendText(this, sel, quiet = true)
+            }
+            return
+        }
+        try {
+            startActivity(
+                Intent(this, ClipActivity::class.java).setAction(ClipActivity.ACTION_AUTO)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            )
+        } catch (ex: Exception) {
+            Log.w(TAG, "fallback", ex)
+        }
+    }
+
+    private fun removeOverlay() {
+        val v = overlay ?: return
+        overlay = null
+        try { getSystemService(WindowManager::class.java).removeView(v) } catch (_: Exception) {}
+    }
+
+    override fun onDestroy() {
+        removeOverlay()
+        super.onDestroy()
+    }
+
+    @Suppress("unused")
+    private fun clipboard() = getSystemService(ClipboardManager::class.java)
+}

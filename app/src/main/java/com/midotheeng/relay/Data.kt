@@ -1,46 +1,58 @@
 package com.midotheeng.relay
 
 import android.content.Context
+import android.util.Base64
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
 class Prefs(ctx: Context) {
     private val app = ctx.applicationContext
-    private val p = app.getSharedPreferences("relay", Context.MODE_PRIVATE)
+    private val p = app.getSharedPreferences("relay2", Context.MODE_PRIVATE)
 
     var deviceName: String
         get() = p.getString("name", null) ?: defaultName()
         set(v) = p.edit().putString("name", v).apply()
 
-    var pairCode: String
-        get() = p.getString("code", "") ?: ""
-        set(v) = p.edit().putString("code", v).apply()
+    val hasName: Boolean get() = p.contains("name")
 
     val deviceId: String
         get() = p.getString("id", null)
-            ?: UUID.randomUUID().toString().also { p.edit().putString("id", it).apply() }
+            ?: UUID.randomUUID().toString().replace("-", "").take(16).also { p.edit().putString("id", it).apply() }
+
+    /**
+     * The secret shared by all your linked devices (your "space").
+     * Every device starts with its own; scanning another device's QR code adopts that device's key.
+     */
+    var spaceKey: ByteArray
+        get() {
+            val s = p.getString("space", null)
+            if (s != null) return Base64.decode(s, Base64.NO_WRAP)
+            val k = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            p.edit().putString("space", Base64.encodeToString(k, Base64.NO_WRAP)).commit()
+            return k
+        }
+        set(v) { p.edit().putString("space", Base64.encodeToString(v, Base64.NO_WRAP)).commit() }
 
     var autoCopy: Boolean
         get() = p.getBoolean("autoCopy", true)
         set(v) = p.edit().putBoolean("autoCopy", v).apply()
 
+    var autoSend: Boolean
+        get() = p.getBoolean("autoSend", true)
+        set(v) = p.edit().putBoolean("autoSend", v).apply()
+
+    var useInternet: Boolean
+        get() = p.getBoolean("internet", true)
+        set(v) = p.edit().putBoolean("internet", v).apply()
+
     var startOnBoot: Boolean
         get() = p.getBoolean("boot", true)
         set(v) = p.edit().putBoolean("boot", v).apply()
-
-    /** Optional fixed IP of the other device, used if discovery fails. */
-    var manualPeer: String
-        get() = p.getString("manual", "") ?: ""
-        set(v) = p.edit().putString("manual", v.trim()).apply()
-
-    /** Copy on one device, paste on the other (needs the one-time log permission). */
-    var universalClipboard: Boolean
-        get() = p.getBoolean("uc", true)
-        set(v) = p.edit().putBoolean("uc", v).apply()
 
     var mirrorNotifs: Boolean
         get() = p.getBoolean("mirror", false)
@@ -50,30 +62,33 @@ class Prefs(ctx: Context) {
         get() = p.getBoolean("openLinks", false)
         set(v) = p.edit().putBoolean("openLinks", v).apply()
 
+    /** Last internet message id seen, so messages missed while offline are picked up. */
+    var cloudSince: String
+        get() = p.getString("since", "") ?: ""
+        set(v) = p.edit().putString("since", v).apply()
+
     var peersJson: String
         get() = p.getString("peers", "[]") ?: "[]"
         set(v) = p.edit().putString("peers", v).apply()
-
-    val isSetUp: Boolean get() = pairCode.length >= 4
 
     private fun defaultName(): String =
         if (app.resources.configuration.smallestScreenWidthDp >= 600) "Tablet" else "Phone"
 }
 
 data class Peer(
-    val id: String, val name: String, val host: String, val lastSeen: Long,
-    val battery: Int = -1, val charging: Boolean = false,
-    /** That device's Universal Clipboard state (see RelayService.clipState). */
-    val uc: String = "",
+    val id: String,
+    val name: String,
+    /** Wi-Fi addresses we can try directly, best first. */
+    val hosts: List<String>,
+    /** Last time we heard from it at all (Wi-Fi or internet). */
+    val lastSeen: Long,
+    /** Last time it reached us directly over Wi-Fi. */
+    val lastLan: Long = 0,
+    val battery: Int = -1,
+    val charging: Boolean = false,
 )
 
-/** Remembers what we last synced so a received item isn't bounced straight back. */
-object Sync {
-    @Volatile var lastText: String? = null
-    @Volatile var lastWriteAt: Long = 0L
-}
-
-/** The other devices running Relay with the same pair code. */
+/** Your other linked devices. */
 object Peers {
     val state = MutableStateFlow<Map<String, Peer>>(emptyMap())
     private var prefs: Prefs? = null
@@ -87,8 +102,8 @@ object Peers {
             val map = mutableMapOf<String, Peer>()
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
-                map[o.getString("id")] =
-                    Peer(o.getString("id"), o.getString("name"), o.getString("host"), o.optLong("seen"))
+                val hosts = o.optJSONArray("hosts")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList()
+                map[o.getString("id")] = Peer(o.getString("id"), o.getString("name"), hosts, o.optLong("seen"), o.optLong("lan"))
             }
             state.value = map
         } catch (_: Exception) {
@@ -97,21 +112,33 @@ object Peers {
 
     fun all(): List<Peer> = state.value.values.sortedByDescending { it.lastSeen }
 
+    /**
+     * Records that we heard from a device. [host] is the address it just reached us from over Wi-Fi;
+     * [ips] are addresses it told us about (e.g. over the internet or in its QR code).
+     */
     @Synchronized
-    fun seen(id: String, name: String, host: String, battery: Int = -1, charging: Boolean = false, uc: String = "") {
-        if (host.isEmpty()) return
+    fun seen(
+        id: String, name: String, host: String? = null, ips: List<String> = emptyList(),
+        battery: Int = -1, charging: Boolean = false,
+    ) {
+        if (id.isEmpty()) return
         val now = System.currentTimeMillis()
         val old = state.value[id]
-        // A reinstalled device gets a new id but keeps its IP: drop stale entries on the same host.
-        val map = state.value.filterValues { it.host != host || it.id == id }.toMutableMap()
-        map[id] = Peer(
-            id, name, host, now,
+        val hosts = (listOfNotNull(host) + ips + (old?.hosts ?: emptyList()))
+            .filter { it.isNotBlank() && !it.contains(':') }.distinct().take(4)
+        val p = Peer(
+            id, name.ifEmpty { old?.name ?: "Device" }, hosts, now,
+            if (host != null) now else old?.lastLan ?: 0,
             if (battery >= 0) battery else old?.battery ?: -1,
             if (battery >= 0) charging else old?.charging ?: false,
-            uc.ifEmpty { old?.uc ?: "" },
         )
-        state.value = map
-        if (old == null || old.host != host || old.name != name || now - old.lastSeen > 60_000) save()
+        state.value = state.value + (id to p)
+        if (old == null || old.hosts != hosts || old.name != p.name || now - old.lastSeen > 60_000) save()
+    }
+
+    @Synchronized
+    fun remove(id: String) {
+        state.value = state.value - id; save()
     }
 
     @Synchronized
@@ -122,7 +149,10 @@ object Peers {
     private fun save() {
         val arr = JSONArray()
         state.value.values.forEach {
-            arr.put(JSONObject().put("id", it.id).put("name", it.name).put("host", it.host).put("seen", it.lastSeen))
+            arr.put(
+                JSONObject().put("id", it.id).put("name", it.name).put("hosts", JSONArray(it.hosts))
+                    .put("seen", it.lastSeen).put("lan", it.lastLan)
+            )
         }
         prefs?.peersJson = arr.toString()
     }
@@ -151,7 +181,7 @@ object History {
     @Synchronized
     fun init(ctx: Context) {
         if (file != null) return
-        val f = File(ctx.filesDir, "history.json")
+        val f = File(ctx.filesDir, "history2.json")
         file = f
         try {
             if (f.exists()) {
@@ -202,5 +232,21 @@ object History {
             file?.writeText(arr.toString())
         } catch (_: Exception) {
         }
+    }
+}
+
+/** Remembers what we last synced so a received item isn't bounced straight back. */
+object Sync {
+    @Volatile var lastText: String? = null
+    @Volatile var lastWriteAt: Long = 0L
+
+    private val seenMsgs = LinkedHashMap<String, Long>()
+
+    /** True the first time a message id is seen (the same message can arrive over Wi-Fi and internet). */
+    fun firstTime(msgId: String): Boolean = synchronized(seenMsgs) {
+        if (msgId.isEmpty()) return true
+        val now = System.currentTimeMillis()
+        seenMsgs.entries.removeAll { now - it.value > 3_600_000 }
+        if (seenMsgs.containsKey(msgId)) false else { seenMsgs[msgId] = now; true }
     }
 }

@@ -7,6 +7,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Color as AColor
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
@@ -20,6 +22,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -39,8 +42,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -48,8 +50,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -67,7 +67,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -76,14 +75,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.core.content.ContextCompat
-import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.ui.text.font.FontFamily
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 
@@ -104,8 +107,6 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         resumeTick.value = resumeTick.value + 1
-        // Starting the clipboard watcher while on screen lets Android show its one-time "allow logs" prompt.
-        RelayService.instance?.startWatcher()
     }
 }
 
@@ -125,106 +126,87 @@ fun RelayTheme(content: @Composable () -> Unit) {
 private fun Root() {
     val ctx = LocalContext.current
     val prefs = remember { Prefs(ctx) }
-    var setUp by remember { mutableStateOf(prefs.isSetUp) }
-
-    val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
-        ) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
-    }
-
-    if (!setUp) {
-        SetupScreen(prefs) {
-            setUp = true
-            RelayService.start(ctx)
-            RelayService.hello(ctx)
-        }
+    var named by remember { mutableStateOf(prefs.hasName) }
+    if (!named) {
+        NameScreen(prefs) { named = true; RelayService.start(ctx) }
     } else {
         LaunchedEffect(Unit) { RelayService.start(ctx) }
-        HomeScreen(prefs) { setUp = false }
+        HomeScreen(prefs)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SetupScreen(prefs: Prefs, onDone: () -> Unit) {
+private fun NameScreen(prefs: Prefs, onDone: () -> Unit) {
     var name by remember { mutableStateOf(prefs.deviceName) }
-    var code by remember { mutableStateOf(prefs.pairCode) }
-    Scaffold(topBar = { TopAppBar(title = { Text("Set up Relay") }) }) { pad ->
+    Scaffold(topBar = { TopAppBar(title = { Text("Welcome to Relay") }) }) { pad ->
         Column(
             Modifier.padding(pad).padding(20.dp).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             Text(
-                "Install Relay on your phone and your tablet, then fill this in on each one. " +
-                    "Both devices need to be on the same Wi-Fi.",
+                "Relay links your Android devices: copy on one, paste on another, and send photos, files and links between them.",
                 style = MaterialTheme.typography.bodyLarge
             )
+            Text("What should we call this device?", style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = name, onValueChange = { name = it },
-                label = { Text("This device's name") }, singleLine = true,
-                modifier = Modifier.fillMaxWidth()
+                singleLine = true, modifier = Modifier.fillMaxWidth()
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("Phone", "Tablet").forEach {
+                listOf("Phone", "Tablet", "Laptop").forEach {
                     FilterChip(selected = name == it, onClick = { name = it }, label = { Text(it) })
                 }
             }
-            OutlinedTextField(
-                value = code, onValueChange = { code = it.trim() },
-                label = { Text("Pair code") }, singleLine = true,
-                supportingText = {
-                    Text("Make one up (4+ characters) and type the SAME code on both devices. It encrypts everything so only your devices can read it.")
-                },
-                modifier = Modifier.fillMaxWidth()
-            )
             Button(
-                onClick = {
-                    val changed = code != prefs.pairCode
-                    prefs.deviceName = name.trim().ifEmpty { "My device" }
-                    prefs.pairCode = code
-                    if (changed) Peers.clear()
-                    onDone()
-                },
-                enabled = code.length >= 4 && name.isNotBlank(),
-                modifier = Modifier.fillMaxWidth()
-            ) { Text("Start") }
+                onClick = { prefs.deviceName = name.trim().ifEmpty { "My device" }; onDone() },
+                enabled = name.isNotBlank(), modifier = Modifier.fillMaxWidth()
+            ) { Text("Continue") }
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
+private fun HomeScreen(prefs: Prefs) {
     val ctx = LocalContext.current
     val peers by Peers.state.collectAsState()
     val history by History.items.collectAsState()
-    val running by RelayService.running.collectAsState()
     var draft by rememberSaveable { mutableStateOf("") }
+    var showAdd by rememberSaveable { mutableStateOf(false) }
     val now by produceState(System.currentTimeMillis()) {
         while (true) { delay(10_000); value = System.currentTimeMillis() }
     }
     val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
         if (uris.isNotEmpty()) RelayService.sendFiles(ctx, uris)
     }
+    val scan = rememberLauncherForActivityResult(ScanContract()) { r ->
+        val text = r.contents ?: return@rememberLauncherForActivityResult
+        val name = RelayService.join(ctx, text)
+        Toast.makeText(
+            ctx, if (name != null) "Linked with $name ✓" else "That isn't a Relay code", Toast.LENGTH_LONG
+        ).show()
+        if (name != null) showAdd = false
+    }
+    val startScan = {
+        scan.launch(
+            ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setPrompt("Point at the code on your other device")
+                .setBeepEnabled(false)
+                .setOrientationLocked(false)
+        )
+    }
+
+    if (showAdd) AddDeviceDialog(onScan = startScan, onClose = { showAdd = false })
 
     Scaffold(
         topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Relay")
-                        Text(prefs.deviceName, style = MaterialTheme.typography.labelMedium)
-                    }
-                },
-                actions = {
-                    IconButton(onClick = {
-                        RelayService.hello(ctx)
-                        Toast.makeText(ctx, "Looking for devices…", Toast.LENGTH_SHORT).show()
-                    }) { Icon(Icons.Default.Refresh, contentDescription = "Find devices") }
+            TopAppBar(title = {
+                Column {
+                    Text("Relay")
+                    Text(prefs.deviceName, style = MaterialTheme.typography.labelMedium)
                 }
-            )
+            })
         }
     ) { pad ->
         LazyColumn(
@@ -235,8 +217,8 @@ private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
             ),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            item { StatusCard(running, peers.values.sortedByDescending { it.lastSeen }, now) }
-            item { UniversalClipboardCard(prefs, ctx) }
+            item { DevicesCard(peers.values.sortedByDescending { it.lastSeen }, now) { showAdd = true } }
+            item { ChecklistCard(prefs) }
             item {
                 Section("Send") {
                     OutlinedTextField(
@@ -254,9 +236,8 @@ private fun HomeScreen(prefs: Prefs, onEditPairing: () -> Unit) {
                     OutlinedButton(onClick = { pick.launch("*/*") }) { Text("Send photos or files") }
                 }
             }
-            item { HowToCard(ctx) }
-            item { ExtrasCard(prefs, ctx) }
-            item { SettingsCard(prefs, ctx, onEditPairing) }
+            item { WaysCard(ctx) }
+            item { SettingsCard(prefs, ctx) }
             if (history.isNotEmpty()) {
                 item {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
@@ -281,40 +262,36 @@ private fun Section(title: String, content: @Composable () -> Unit) {
     }
 }
 
+// ---------------- devices ----------------
+
 @Composable
-private fun StatusCard(running: Boolean, peers: List<Peer>, now: Long) {
-    // Only "Linked" if the other device actually answered in the last 3 minutes.
-    val linked = peers.any { now - it.lastSeen < 3 * 60_000 }
+private fun DevicesCard(peers: List<Peer>, now: Long, onAdd: () -> Unit) {
+    val ctx = LocalContext.current
+    val internet by RelayService.internetUp.collectAsState()
     Card(
         Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (linked) MaterialTheme.colorScheme.primaryContainer
-            else MaterialTheme.colorScheme.surfaceVariant
-        )
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
     ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                when {
-                    !running -> "Starting…"
-                    linked -> "Linked"
-                    peers.isNotEmpty() -> "Can't reach ${peers.first().name} right now"
-                    else -> "Looking for your other device…"
-                },
-                style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold
-            )
-            if (!linked) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Your devices", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            if (peers.isEmpty()) {
                 Text(
-                    "Open Relay on the other device (same Wi-Fi, same pair code, latest version). " +
-                        "On the Huawei tablet also allow Relay in Settings → Battery → App launch. Then tap ⟳ above.",
+                    "Nothing linked yet. Install Relay on your other device, open it, then tap “Add a device” on both: " +
+                        "one shows a code, the other scans it. That's all.",
                     style = MaterialTheme.typography.bodyMedium
                 )
             }
             peers.forEach { p ->
-                val fresh = now - p.lastSeen < 5 * 60_000
+                val wifi = now - p.lastLan < 3 * 60_000
+                val online = wifi || now - p.lastSeen < 35 * 60_000
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         Modifier.size(10.dp).background(
-                            if (fresh) Color(0xFF22C55E) else Color(0xFF9CA3AF), CircleShape
+                            when {
+                                wifi -> Color(0xFF22C55E)
+                                online -> Color(0xFF3B82F6)
+                                else -> Color(0xFF9CA3AF)
+                            }, CircleShape
                         )
                     )
                     Spacer(Modifier.width(10.dp))
@@ -324,34 +301,172 @@ private fun StatusCard(running: Boolean, peers: List<Peer>, now: Long) {
                             style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium
                         )
                         Text(
-                            "${p.host} · seen " + DateUtils.getRelativeTimeSpanString(p.lastSeen, now, DateUtils.MINUTE_IN_MILLIS),
+                            when {
+                                wifi -> "Connected on Wi-Fi"
+                                online -> "Connected over the internet"
+                                else -> "Last seen " + DateUtils.getRelativeTimeSpanString(p.lastSeen, now, DateUtils.MINUTE_IN_MILLIS)
+                            },
                             style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    val ctx = LocalContext.current
-                    FilledTonalButton(onClick = { RelayService.ring(ctx) }) { Text("Ring") }
+                    TextButton(onClick = { RelayService.ring(ctx, p.id) }) { Text("Ring") }
                 }
             }
-            val ips = Util.localIps()
-            if (ips.isNotEmpty()) Text("This device: ${ips.joinToString()}", style = MaterialTheme.typography.bodySmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = onAdd) { Text("Add a device") }
+                if (peers.isNotEmpty()) TextButton(onClick = { RelayService.hello(ctx) }) { Text("Refresh") }
+            }
+            if (!internet && Prefs(ctx).useInternet) {
+                Text(
+                    "Internet link is offline right now. Devices on the same Wi-Fi still work.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
         }
     }
 }
 
 @Composable
-private fun HowToCard(ctx: Context) {
-    Section("Send without opening Relay") {
-        Tip("1", "Select any text → tap “Relay” in the menu (look under ⋮ if you don't see it). It goes straight to your other device and is already copied there.")
-        Tip("2", "After copying something, tap the “Send clipboard” tile in Quick Settings, or the button on Relay's notification.")
-        Tip("3", "Share any photo, video, file or link → tap your other device's icon at the top of the share menu (or Relay).")
-        Tip("4", "Anything that arrives is copied to the clipboard automatically — just paste. Photos are also saved to Pictures/Relay.")
+private fun AddDeviceDialog(onScan: () -> Unit, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val qr = remember { qrBitmap(RelayService.qrText(ctx)) }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Add a device") },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "On the other device, open Relay → Add a device → Scan a code, and point it at this:",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Image(
+                    bitmap = qr.asImageBitmap(), contentDescription = "Relay link code",
+                    modifier = Modifier.size(240.dp).background(Color.White).padding(8.dp)
+                )
+                Text(
+                    "Or scan the code shown on the other device instead. Either way works, and every device you add joins the same group.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        },
+        confirmButton = { Button(onClick = onScan) { Text("Scan a code") } },
+        dismissButton = { TextButton(onClick = onClose) { Text("Close") } }
+    )
+}
+
+private fun qrBitmap(text: String, size: Int = 640): Bitmap {
+    val m = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size, size, mapOf(EncodeHintType.MARGIN to 1))
+    val px = IntArray(size * size)
+    for (y in 0 until size) for (x in 0 until size) px[y * size + x] = if (m[x, y]) AColor.BLACK else AColor.WHITE
+    return Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).apply { setPixels(px, 0, size, 0, 0, size, size) }
+}
+
+// ---------------- permissions checklist ----------------
+
+private class Check(
+    val title: String,
+    val why: String,
+    val done: Boolean,
+    val button: String,
+    val onClick: () -> Unit,
+    val extra: (@Composable () -> Unit)? = null,
+)
+
+@Composable
+private fun ChecklistCard(prefs: Prefs) {
+    val ctx = LocalContext.current
+    val tick by resumeTick.collectAsState()
+    val sp = remember { ctx.getSharedPreferences("relay2", Context.MODE_PRIVATE) }
+    val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { resumeTick.value++ }
+    val isHuawei = Build.MANUFACTURER.equals("HUAWEI", true) || Build.MANUFACTURER.equals("HONOR", true)
+
+    val checks = remember(tick) {
+        val list = mutableListOf<Check>()
+        if (Build.VERSION.SDK_INT >= 33) {
+            list += Check(
+                "Show what arrives",
+                "Lets Relay tell you when something comes in.",
+                ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED,
+                "Allow", { notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS) }
+            )
+        }
+        list += Check(
+            "Keep running in the background",
+            "So things arrive even when Relay is closed.",
+            ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName),
+            "Allow", {
+                try {
+                    ctx.startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${ctx.packageName}")))
+                } catch (_: Exception) {
+                    ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
+            }
+        )
+        if (isHuawei) {
+            list += Check(
+                "Huawei: let Relay start by itself",
+                "In the list, find Relay, turn off “Manage automatically”, and turn on all three switches.",
+                sp.getBoolean("huaweiDone", false),
+                "Open", {
+                    sp.edit().putBoolean("huaweiDone", true).apply()
+                    try {
+                        ctx.startActivity(
+                            Intent().setComponent(
+                                ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
+                            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    } catch (_: Exception) {
+                        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+                    }
+                }
+            )
+        }
+        list += Check(
+            "Send what I copy, automatically",
+            "Turn on “Relay: send what I copy” in Accessibility. Then anything you copy is ready to paste on your other devices.",
+            ClipWatchService.isOn(ctx),
+            "Turn on", {
+                try { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}
+            },
+            extra = {
+                Text(
+                    "Switch greyed out? Tap App info → ⋮ (top right) → “Allow restricted settings”, then try again.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                TextButton(onClick = {
+                    ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+                }) { Text("App info") }
+            }
+        )
+        list
+    }
+    val todo = checks.filter { !it.done }
+
+    Section(if (todo.isEmpty()) "All set ✓" else "Make it seamless (${checks.size - todo.size}/${checks.size})") {
+        if (todo.isEmpty()) {
+            Text("Relay has everything it needs on this device.", style = MaterialTheme.typography.bodyMedium)
+        }
+        todo.forEach { c ->
+            HorizontalDivider()
+            Text(c.title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
+            Text(c.why, style = MaterialTheme.typography.bodySmall)
+            Button(onClick = c.onClick) { Text(c.button) }
+            c.extra?.invoke()
+        }
+    }
+}
+
+// ---------------- ways to send ----------------
+
+@Composable
+private fun WaysCard(ctx: Context) {
+    Section("Ways to send") {
+        Tip("•", "Copy anything. With auto-send on, it's ready to paste on your other devices.")
+        Tip("•", "Select text → tap “Relay” in the menu (look under ⋮ if you don't see it).")
+        Tip("•", "Share any photo, video, file or link → tap a device at the top of the share menu, or Relay.")
+        Tip("•", "The “Send clipboard” button on Relay's notification or Quick Settings tile.")
         if (Build.VERSION.SDK_INT >= 33) {
             OutlinedButton(onClick = { addTile(ctx) }) { Text("Add the Quick Settings tile") }
-        } else {
-            Text(
-                "To add the tile: pull down Quick Settings → edit (pencil) → drag “Send clipboard” in.",
-                style = MaterialTheme.typography.bodySmall
-            )
         }
     }
 }
@@ -359,7 +474,7 @@ private fun HowToCard(ctx: Context) {
 @Composable
 private fun Tip(n: String, text: String) {
     Row {
-        Text("$n.", fontWeight = FontWeight.Bold, modifier = Modifier.width(22.dp))
+        Text(n, fontWeight = FontWeight.Bold, modifier = Modifier.width(18.dp))
         Text(text, style = MaterialTheme.typography.bodyMedium)
     }
 }
@@ -378,57 +493,72 @@ private fun addTile(ctx: Context) {
     }
 }
 
+// ---------------- settings ----------------
+
 @Composable
-private fun SettingsCard(prefs: Prefs, ctx: Context, onEditPairing: () -> Unit) {
-    var autoCopy by remember { mutableStateOf(prefs.autoCopy) }
-    var boot by remember { mutableStateOf(prefs.startOnBoot) }
-    var manual by remember { mutableStateOf(prefs.manualPeer) }
-    val pm = ctx.getSystemService(PowerManager::class.java)
+private fun SettingsCard(prefs: Prefs, ctx: Context) {
     val tick by resumeTick.collectAsState()
-    val unrestricted = remember(tick) { pm.isIgnoringBatteryOptimizations(ctx.packageName) }
+    var autoCopy by remember { mutableStateOf(prefs.autoCopy) }
+    var autoSend by remember { mutableStateOf(prefs.autoSend) }
+    var internet by remember { mutableStateOf(prefs.useInternet) }
+    var links by remember { mutableStateOf(prefs.openLinks) }
+    var mirror by remember { mutableStateOf(prefs.mirrorNotifs) }
+    var boot by remember { mutableStateOf(prefs.startOnBoot) }
+    var name by remember { mutableStateOf(prefs.deviceName) }
+    var confirmUnlink by remember { mutableStateOf(false) }
+    val listenerOn = remember(tick) {
+        NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
+    }
+
+    if (confirmUnlink) {
+        AlertDialog(
+            onDismissRequest = { confirmUnlink = false },
+            title = { Text("Unlink this device?") },
+            text = { Text("This device will stop syncing with all your other devices. You can link again with a code.") },
+            confirmButton = {
+                Button(onClick = { RelayService.unlinkAll(ctx); confirmUnlink = false }) { Text("Unlink") }
+            },
+            dismissButton = { TextButton(onClick = { confirmUnlink = false }) { Text("Cancel") } }
+        )
+    }
 
     Section("Settings") {
-        SwitchRow("Copy received items to clipboard", autoCopy) { autoCopy = it; prefs.autoCopy = it }
+        SwitchRow("Copy what arrives to the clipboard", autoCopy) { autoCopy = it; prefs.autoCopy = it }
+        SwitchRow("Send what I copy automatically", autoSend) { autoSend = it; prefs.autoSend = it }
+        SwitchRow("Use the internet when not on the same Wi-Fi", internet) {
+            internet = it; prefs.useInternet = it; RelayService.hello(ctx)
+        }
+        Text(
+            "Encrypted with a key only your devices have, and passed through the free ntfy.sh relay.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        SwitchRow("Open links that arrive here right away", links) { links = it; prefs.openLinks = it }
+        SwitchRow("Show this device's notifications on my other devices", mirror) {
+            mirror = it
+            prefs.mirrorNotifs = it
+            if (it && !listenerOn) ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+        if (mirror && !listenerOn) {
+            TextButton(onClick = { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
+                Text("Allow notification access")
+            }
+        }
         SwitchRow("Start when the device turns on", boot) { boot = it; prefs.startOnBoot = it }
         HorizontalDivider()
-        if (!unrestricted) {
-            Text(
-                "Let Relay run in the background, or the system may stop it and items won't arrive.",
-                style = MaterialTheme.typography.bodyMedium
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedTextField(
+                value = name, onValueChange = { name = it },
+                label = { Text("This device's name") }, singleLine = true,
+                modifier = Modifier.weight(1f)
             )
-            Button(onClick = {
-                try {
-                    ctx.startActivity(
-                        Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${ctx.packageName}"))
-                    )
-                } catch (_: Exception) {
-                    ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-                }
-            }) { Text("Allow background running") }
+            TextButton(
+                onClick = { prefs.deviceName = name.trim().ifEmpty { "My device" }; RelayService.hello(ctx) },
+                enabled = name.isNotBlank() && name.trim() != prefs.deviceName
+            ) { Text("Save") }
         }
-        if (Build.MANUFACTURER.equals("HUAWEI", true) || Build.MANUFACTURER.equals("HONOR", true)) {
-            Text(
-                "Huawei tablet: also go to Settings → Battery → App launch → Relay → turn off “Manage automatically” and turn on all three switches.",
-                style = MaterialTheme.typography.bodySmall
-            )
-            TextButton(onClick = {
-                try {
-                    ctx.startActivity(Intent().setComponent(
-                        ComponentName("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
-                    ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                } catch (_: Exception) {
-                    ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
-                }
-            }) { Text("Open App launch settings") }
+        TextButton(onClick = { confirmUnlink = true }) {
+            Text("Unlink this device", color = MaterialTheme.colorScheme.error)
         }
-        HorizontalDivider()
-        OutlinedTextField(
-            value = manual,
-            onValueChange = { manual = it.trim(); prefs.manualPeer = it },
-            label = { Text("Other device's IP (only if it isn't found)") },
-            singleLine = true, modifier = Modifier.fillMaxWidth()
-        )
-        TextButton(onClick = onEditPairing) { Text("Change name or pair code") }
     }
 }
 
@@ -439,6 +569,8 @@ private fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Un
         Switch(checked = checked, onCheckedChange = onChange)
     }
 }
+
+// ---------------- history ----------------
 
 @Composable
 private fun HistoryRow(item: Item, now: Long) {
@@ -469,167 +601,5 @@ private fun HistoryRow(item: Item, now: Long) {
                 style = MaterialTheme.typography.bodyMedium
             )
         }
-    }
-}
-
-@Composable
-private fun UniversalClipboardCard(prefs: Prefs, ctx: Context) {
-    val state by RelayService.clipState.collectAsState()
-    var enabled by remember { mutableStateOf(prefs.universalClipboard) }
-    Section("Universal Clipboard") {
-        SwitchRow("Copy here, paste there — automatically", enabled) {
-            enabled = it
-            prefs.universalClipboard = it
-            RelayService.instance?.startWatcher() ?: RelayService.hello(ctx)
-        }
-        if (!enabled) return@Section
-        when (state) {
-            "active" -> Text(
-                "On ✓  Copy anything on this device and it's ready to paste on your other device. " +
-                    "Do this setup on both devices to make it work both ways.",
-                style = MaterialTheme.typography.bodyMedium
-            )
-            "no_logs" -> SelfSetup(ctx)
-            "no_overlay" -> {
-                Text(
-                    "Almost there: allow Relay to display over other apps. It uses an invisible 1-pixel window to read the clipboard the moment you copy.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Button(onClick = {
-                    ctx.startActivity(
-                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}"))
-                    )
-                }) { Text("Allow display over other apps") }
-            }
-            "needs_approval" -> {
-                Text(
-                    "Tap Turn on. If Android asks “Allow Relay to access all device logs?”, choose Allow. " +
-                        "Newer Android asks again after each restart — Relay's notification will remind you.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                Button(onClick = { RelayService.instance?.startWatcher() ?: RelayService.start(ctx) }) { Text("Turn on") }
-            }
-            else -> Text("Starting…", style = MaterialTheme.typography.bodyMedium)
-        }
-        PeerSetup(ctx)
-    }
-}
-
-@Composable
-private fun ExtrasCard(prefs: Prefs, ctx: Context) {
-    val tick by resumeTick.collectAsState()
-    var mirror by remember { mutableStateOf(prefs.mirrorNotifs) }
-    var links by remember { mutableStateOf(prefs.openLinks) }
-    val listenerOn = remember(tick) {
-        NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)
-    }
-    val overlayOn = remember(tick) { Settings.canDrawOverlays(ctx) }
-    Section("Ecosystem") {
-        SwitchRow("Show this device's notifications on the other one", mirror) {
-            mirror = it
-            prefs.mirrorNotifs = it
-            if (it && !listenerOn) ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        }
-        if (mirror && !listenerOn) {
-            Text("Give Relay notification access so it can forward them.", style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = { ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }) {
-                Text("Allow notification access")
-            }
-        }
-        Text(
-            "Dismissing one on this device clears it on the other. Tapping it opens the same app there, if it's installed.",
-            style = MaterialTheme.typography.bodySmall
-        )
-        HorizontalDivider()
-        SwitchRow("Open links that arrive here straight away", links) { links = it; prefs.openLinks = it }
-        if (links && !overlayOn) {
-            Text(
-                "Needs “Display over other apps” (same as Universal Clipboard), or links will only show as a notification.",
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
-    }
-}
-
-/** This device isn't unlocked yet: show only the step that's needed now. */
-@Composable
-private fun SelfSetup(ctx: Context) {
-    val tick by resumeTick.collectAsState()
-    val peers by Peers.state.collectAsState()
-    val devOn = remember(tick) { AdbSetup.isDevOptionsOn(ctx) }
-    val other = peers.values.maxByOrNull { it.lastSeen }?.name ?: "other device"
-    var asked by remember { mutableStateOf(false) }
-    var skipDev by remember { mutableStateOf(false) }
-
-    Text(
-        "One-time unlock. Your $other does it for you over Wi-Fi, so you don't need a computer.",
-        style = MaterialTheme.typography.bodyMedium
-    )
-    when {
-        peers.isEmpty() -> Text(
-            "First, link your other device (open Relay on it with the same pair code).",
-            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error
-        )
-        !devOn && !skipDev -> {
-            Tip("1", "Turn on Developer options: tap the button, find “Build number” and tap it 7 times. Then come back here.")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = {
-                    try { ctx.startActivity(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)) } catch (_: Exception) {}
-                }) { Text("Open About") }
-                TextButton(onClick = { skipDev = true }) { Text("It's already on →") }
-            }
-        }
-        else -> {
-            Tip("1", "Tap the button. Turn on Wireless debugging, then tap “Pair device with pairing code”.")
-            Tip("2", "Leave the code on screen and type it into Relay on your $other (a notification pops up there).")
-            Button(onClick = {
-                RelayService.requestSetup(ctx)
-                asked = true
-                if (!AdbSetup.openWirelessDebugging(ctx)) {
-                    Toast.makeText(ctx, "Open Settings → Developer options → Wireless debugging", Toast.LENGTH_LONG).show()
-                }
-            }) { Text("Open Wireless debugging") }
-            if (asked) Text(
-                "Your $other is waiting for the code.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary
-            )
-        }
-    }
-}
-
-/** On this device: type in the code shown on another device to unlock it. */
-@Composable
-private fun PeerSetup(ctx: Context) {
-    val peers by Peers.state.collectAsState()
-    val states by AdbSetup.state.collectAsState()
-    val waiting = peers.values.filter { it.uc == "no_logs" || states.containsKey(it.host) }
-    waiting.forEach { p -> key(p.host) { PeerSetupRow(ctx, p, states[p.host]) } }
-}
-
-@Composable
-private fun PeerSetupRow(ctx: Context, p: Peer, st: String?) {
-    var code by remember { mutableStateOf("") }
-    HorizontalDivider()
-    Text("Unlock ${p.name}", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-    if (st == "done") {
-        Text("Done ✓ ${p.name} is restarting with Universal Clipboard on.", color = MaterialTheme.colorScheme.primary)
-    } else {
-        Text(
-            "On ${p.name}, open Relay and tap “Open Wireless debugging”, then type the 6-digit code it shows:",
-            style = MaterialTheme.typography.bodySmall
-        )
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(
-                value = code, onValueChange = { code = it },
-                placeholder = { Text("123456") }, singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
-            Button(
-                onClick = { AdbSetup.setupPeer(ctx, p.host, p.name, code) },
-                enabled = code.count { it.isDigit() } >= 6 && st?.startsWith("working") != true
-            ) { Text("Unlock") }
-        }
-        if (st != null && st.startsWith("working:")) Text(st.removePrefix("working:"), color = MaterialTheme.colorScheme.primary)
-        if (st != null && st.startsWith("error:")) Text(st.removePrefix("error:"), color = MaterialTheme.colorScheme.error)
     }
 }

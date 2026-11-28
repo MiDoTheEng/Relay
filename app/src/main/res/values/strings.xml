@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Relay</string>
+    <string name="clip_watch_desc">Lets Relay notice when you copy something, so it can send it to your other linked devices automatically. Relay only looks for copy actions; it does not read or store what is on your screen.</string>
 </resources>

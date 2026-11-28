@@ -3,6 +3,7 @@ package com.midotheeng.relay
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -16,33 +17,43 @@ import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.Mac
-import javax.crypto.SecretKeyFactory
-import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 
-/** Keys come from the pair code, so only devices with the same code can read each other. */
-object Crypto {
-    private var cachedCode: String? = null
-    private var encKey = ByteArray(32)
-    private var macKey = ByteArray(32)
+/** Keys for one "space" (your set of linked devices). */
+class Keys(space: ByteArray) {
+    val enc: ByteArray = hmac(space, "relay-enc").copyOf(32)
+    val mac: ByteArray = hmac(space, "relay-mac").copyOf(32)
+    /** Internet channel name. Derived from the secret, so nobody can guess it. */
+    val topic: String = "relay_" + hmac(space, "relay-topic").joinToString("") { "%02x".format(it) }.take(40)
 
-    @Synchronized
-    fun keys(code: String): Pair<ByteArray, ByteArray> {
-        if (code != cachedCode) {
-            val spec = PBEKeySpec(code.toCharArray(), "relay-pair-v1".toByteArray(), 20000, 512)
-            val k = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
-            encKey = k.copyOfRange(0, 32)
-            macKey = k.copyOfRange(32, 64)
-            cachedCode = code
-        }
-        return encKey to macKey
+    fun newMac(): Mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(mac, "HmacSHA256")) }
+
+    fun tag(s: String): String = newMac().doFinal(s.toByteArray()).joinToString("") { "%02x".format(it) }.take(32)
+
+    /** Encrypt-then-MAC a small blob: iv(16) | AES-CTR(data) | HMAC(32). */
+    fun seal(data: ByteArray): ByteArray {
+        val iv = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val c = data.copyOf()
+        Ctr(enc, iv).apply(c, 0, c.size)
+        val m = newMac().apply { update(iv); update(c) }.doFinal()
+        return iv + c + m
     }
 
-    fun mac(key: ByteArray): Mac =
-        Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }
+    fun open(blob: ByteArray): ByteArray? {
+        if (blob.size < 48) return null
+        val iv = blob.copyOfRange(0, 16)
+        val c = blob.copyOfRange(16, blob.size - 32)
+        val m = blob.copyOfRange(blob.size - 32, blob.size)
+        val expect = newMac().apply { update(iv); update(c) }.doFinal()
+        if (!MessageDigest.isEqual(m, expect)) return null
+        Ctr(enc, iv).apply(c, 0, c.size)
+        return c
+    }
 
-    fun tag(code: String, s: String): String =
-        mac(keys(code).second).doFinal(s.toByteArray()).joinToString("") { "%02x".format(it) }.take(32)
+    companion object {
+        private fun hmac(key: ByteArray, s: String): ByteArray =
+            Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }.doFinal(s.toByteArray())
+    }
 }
 
 /** AES-CTR keystream, generated in chunks so big files stay fast. */
@@ -77,26 +88,44 @@ class Ctr(key: ByteArray, iv: ByteArray) {
     companion object { private const val CHUNK = 8192 }
 }
 
-class PairMismatch : IOException("The other device has a different pair code")
+class WrongSpace : IOException("That device belongs to a different set of linked devices")
+
+/** A message between devices: a JSON header plus an optional body. */
+object Packet {
+    /** [hdrLen(4) | header JSON | body] — used inside both Wi-Fi frames and internet blobs. */
+    fun pack(header: JSONObject, body: ByteArray): ByteArray {
+        val hb = header.toString().toByteArray()
+        val out = ByteArrayOutputStream(4 + hb.size + body.size)
+        out.write(ByteBuffer.allocate(4).putInt(hb.size).array())
+        out.write(hb)
+        out.write(body)
+        return out.toByteArray()
+    }
+
+    fun unpack(data: ByteArray): Pair<JSONObject, ByteArray>? = try {
+        val hl = ByteBuffer.wrap(data, 0, 4).int
+        if (hl !in 1..65536 || 4 + hl > data.size) null
+        else JSONObject(String(data, 4, hl)) to data.copyOfRange(4 + hl, data.size)
+    } catch (_: Exception) { null }
+}
 
 /**
- * Frame: "RLY1" | iv(16) | enc[ hdrLen(4) | header JSON | body ] | HMAC-SHA256(iv + ciphertext)
- * Receiver answers 1 = ok, 2 = wrong pair code.
+ * Direct Wi-Fi transfer.
+ * Frame: "RLY2" | iv(16) | enc[ hdrLen(4) | header | body ] | HMAC(iv + ciphertext). Reply: 1 ok, 2 wrong space.
  */
 object Wire {
-    const val PORT = 47821
-    const val UDP_PORT = 47822
-    private val MAGIC = "RLY1".toByteArray()
+    const val PORT = 47831
+    const val UDP_PORT = 47832
+    private val MAGIC = "RLY2".toByteArray()
 
-    fun send(host: String, header: JSONObject, body: InputStream, bodyLen: Long, code: String) {
+    fun send(host: String, keys: Keys, header: JSONObject, body: InputStream, bodyLen: Long, connectTimeout: Int = 2500) {
         Socket().use { s ->
-            s.connect(InetSocketAddress(host, PORT), 4000)
+            s.connect(InetSocketAddress(host, PORT), connectTimeout)
             s.soTimeout = 20000
             val out = BufferedOutputStream(s.getOutputStream(), 65536)
-            val (ek, mk) = Crypto.keys(code)
             val iv = ByteArray(16).also { SecureRandom().nextBytes(it) }
-            val ctr = Ctr(ek, iv)
-            val mac = Crypto.mac(mk)
+            val ctr = Ctr(keys.enc, iv)
+            val mac = keys.newMac()
             mac.update(iv)
             out.write(MAGIC)
             out.write(iv)
@@ -120,15 +149,15 @@ object Wire {
             s.soTimeout = 60000
             when (s.getInputStream().read()) {
                 1 -> Unit
-                2 -> throw PairMismatch()
-                else -> throw IOException("No answer from the other device")
+                2 -> throw WrongSpace()
+                else -> throw IOException("No answer")
             }
         }
     }
 
     class Incoming(val header: JSONObject, val file: File, val from: InetAddress)
 
-    fun receive(s: Socket, code: String, tmpDir: File): Incoming? {
+    fun receive(s: Socket, keys: Keys, tmpDir: File): Incoming? {
         s.soTimeout = 30000
         val inp = DataInputStream(BufferedInputStream(s.getInputStream(), 65536))
         val out = s.getOutputStream()
@@ -137,9 +166,8 @@ object Wire {
         if (!magic.contentEquals(MAGIC)) return null
         val iv = ByteArray(16)
         inp.readFully(iv)
-        val (ek, mk) = Crypto.keys(code)
-        val ctr = Ctr(ek, iv)
-        val mac = Crypto.mac(mk)
+        val ctr = Ctr(keys.enc, iv)
+        val mac = keys.newMac()
         mac.update(iv)
         fun r(b: ByteArray, off: Int = 0, len: Int = b.size) {
             inp.readFully(b, off, len); mac.update(b, off, len); ctr.apply(b, off, len)
