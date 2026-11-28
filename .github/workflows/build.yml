@@ -22,6 +22,9 @@ jobs:
           gradle-version: "8.11.1"
       - name: Build
         run: gradle assembleRelease --no-daemon --stacktrace
+      - name: Check the internet relay still behaves as Relay expects
+        continue-on-error: true
+        run: gradle testReleaseUnitTest --no-daemon -i | grep -E "ntfy|HTTP|PASSED|FAILED|round trip|->" || true
       - name: Rename
         run: cp app/build/outputs/apk/release/app-release.apk Relay.apk
       - uses: actions/upload-artifact@v4
