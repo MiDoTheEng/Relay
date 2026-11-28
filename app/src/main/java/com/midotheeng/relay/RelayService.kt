@@ -444,8 +444,12 @@ class RelayService : Service() {
     private fun onText(text: String, from: String, fresh: Boolean) {
         val item = Item(History.newId(), outgoing = false, kind = "text", text = text.take(100_000), peer = from)
         History.add(item)
-        if (!fresh) return // arrived late (device was offline): keep it in history only
-        if (prefs.autoCopy) main.post { Util.copyText(this, text) }
+        if (!fresh) { AutoLog.add("Received late from $from (kept in history only)"); return }
+        val preview = text.take(25).replace('\n', ' ')
+        if (prefs.autoCopy) main.post {
+            val ok = Util.copyText(this, text)
+            AutoLog.add("Received from $from: “$preview” → " + if (ok) "on clipboard ✓" else "Android refused the clipboard ✗")
+        } else AutoLog.add("Received from $from: “$preview” (copy to clipboard is off)")
         if (prefs.openLinks && Util.looksLikeUrl(text)) {
             main.post {
                 try {
@@ -619,6 +623,7 @@ class RelayService : Service() {
     }
 
     @Volatile private var lastError: String? = null
+    @Volatile private var lastVia: String = ""
 
     /**
      * Sends to every linked device (or only [only]): straight over Wi-Fi when possible,
@@ -629,6 +634,7 @@ class RelayService : Service() {
 
     private fun deliverStream(header: JSONObject, size: Long, only: String? = null, open: () -> java.io.InputStream): List<String> {
         lastError = null
+        lastVia = ""
         val targets = Peers.all().filter { only == null || it.id == only }
         if (targets.isEmpty()) { lastError = "No linked devices yet. Open Relay and tap “Add a device”."; return emptyList() }
         val reached = mutableListOf<String>()
@@ -647,7 +653,7 @@ class RelayService : Service() {
                     Log.d(TAG, "wifi ${p.name} $h: ${e.message}")
                 }
             }
-            if (ok) reached += p.name else missed += p
+            if (ok) { reached += p.name; lastVia = "Wi-Fi" } else missed += p
         }
         if (missed.isNotEmpty() && prefs.useInternet) {
             try {
@@ -655,6 +661,7 @@ class RelayService : Service() {
                 val bytes = open().use { it.readBytes() }
                 cloud.publish(JSONObject(header.toString()).put("size", size), bytes)
                 reached += missed.map { it.name }
+                lastVia = if (lastVia.isEmpty()) "internet" else "Wi-Fi + internet"
             } catch (e: Exception) {
                 Log.w(TAG, "internet", e)
                 lastError = e.message ?: "No internet"
@@ -670,6 +677,10 @@ class RelayService : Service() {
     internal fun doSendText(text: String, quiet: Boolean) {
         val bytes = text.toByteArray(Charsets.UTF_8)
         val reached = deliver(header("text"), bytes)
+        AutoLog.add(
+            if (reached.isNotEmpty()) "Delivered to ${reached.joinToString()} via $lastVia"
+            else "Not delivered: ${failMessage()}"
+        )
         if (reached.isNotEmpty()) {
             History.add(Item(History.newId(), outgoing = true, kind = "text", text = text.take(100_000), peer = reached.joinToString()))
             if (!quiet) toast("Sent to ${reached.joinToString()} ✓")

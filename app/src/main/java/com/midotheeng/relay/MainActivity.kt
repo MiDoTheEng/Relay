@@ -500,9 +500,9 @@ private fun AutoSendCard() {
     val events by AutoLog.events.collectAsState()
     val last by AutoLog.lastEvent.collectAsState()
     val connected by AutoLog.connected.collectAsState()
-    if (!on) return
+    if (!on && lines.isEmpty()) return
     Section("Auto-send activity") {
-        Text(
+        if (on) Text(
             if (connected) "Listening ✓ · $events screen events received" else
                 "The switch is on, but Android hasn't started Relay's listener. Turn “Relay: send what I copy” off and on again.",
             style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium,
