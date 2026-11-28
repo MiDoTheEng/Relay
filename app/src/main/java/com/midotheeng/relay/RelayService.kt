@@ -358,6 +358,7 @@ class RelayService : Service() {
                     ss.reuseAddress = true
                     ss.bind(InetSocketAddress(Wire.PORT))
                     server = ss
+                    AutoLog.add("Ready for Wi-Fi connections on ${Util.localIps().joinToString().ifEmpty { "(no Wi-Fi)" }}")
                     while (alive) {
                         val s = ss.accept()
                         io.execute {
@@ -367,6 +368,7 @@ class RelayService : Service() {
                 }
             } catch (e: Exception) {
                 if (!alive) return
+                AutoLog.add("Can't accept Wi-Fi connections: ${e.message}")
                 Log.w(TAG, "server", e)
                 Thread.sleep(3000)
             }
@@ -637,10 +639,26 @@ class RelayService : Service() {
         lastVia = ""
         val targets = Peers.all().filter { only == null || it.id == only }
         if (targets.isEmpty()) { lastError = "No linked devices yet. Open Relay and tap “Add a device”."; return emptyList() }
+
+        // Small things (text, notifications) go over the internet AND Wi-Fi at the same time:
+        // whichever arrives first wins, the other is ignored. No waiting for Wi-Fi to time out.
+        val raceCloud = prefs.useInternet && size <= 64 * 1024
+        val cloudJob: java.util.concurrent.Future<Boolean>? = if (raceCloud) {
+            val bytes = open().use { it.readBytes() }
+            io.submit<Boolean> {
+                try {
+                    cloud.publish(JSONObject(header.toString()).put("size", size), bytes); true
+                } catch (e: Exception) {
+                    Log.w(TAG, "internet", e); lastError = e.message ?: "No internet"; false
+                }
+            }
+        } else null
+
         val reached = mutableListOf<String>()
         val missed = mutableListOf<Peer>()
         for (p in targets) {
             var ok = false
+            var why = ""
             for (h in p.hosts) {
                 try {
                     open().use { Wire.send(h, keys(), JSONObject(header.toString()), it, size) }
@@ -649,13 +667,25 @@ class RelayService : Service() {
                     break
                 } catch (e: WrongSpace) {
                     lastError = "${p.name} is linked to other devices. Link it again."
+                    why = "linked to other devices"
                 } catch (e: Exception) {
-                    Log.d(TAG, "wifi ${p.name} $h: ${e.message}")
+                    why = "$h: ${e.message ?: e.javaClass.simpleName}"
+                    Log.d(TAG, "wifi ${p.name} $why")
                 }
             }
-            if (ok) { reached += p.name; lastVia = "Wi-Fi" } else missed += p
+            if (ok) { reached += p.name; lastVia = "Wi-Fi" } else {
+                missed += p
+                noteWifiProblem(p.name, if (p.hosts.isEmpty()) "no Wi-Fi address known yet" else why)
+            }
         }
-        if (missed.isNotEmpty() && prefs.useInternet) {
+        if (missed.isEmpty()) return reached
+        if (cloudJob != null) {
+            val ok = try { cloudJob.get(20, TimeUnit.SECONDS) } catch (_: Exception) { false }
+            if (ok) {
+                reached += missed.map { it.name }
+                lastVia = if (lastVia.isEmpty()) "internet" else "Wi-Fi + internet"
+            }
+        } else if (prefs.useInternet) {
             try {
                 if (size > Cloud.MAX_BYTES) throw Cloud.TooBig()
                 val bytes = open().use { it.readBytes() }
@@ -666,10 +696,22 @@ class RelayService : Service() {
                 Log.w(TAG, "internet", e)
                 lastError = e.message ?: "No internet"
             }
-        } else if (missed.isNotEmpty()) {
+        } else {
             lastError = "Couldn't reach ${missed.joinToString { it.name }} on Wi-Fi (internet sending is off)."
         }
         return reached
+    }
+
+    private val wifiNotes = HashMap<String, Long>()
+
+    /** Shows (at most once a minute per device) why the direct Wi-Fi connection failed. */
+    private fun noteWifiProblem(name: String, why: String) {
+        val now = System.currentTimeMillis()
+        synchronized(wifiNotes) {
+            if (now - (wifiNotes[name] ?: 0) < 60_000) return
+            wifiNotes[name] = now
+        }
+        AutoLog.add("Wi-Fi to $name failed ($why)")
     }
 
     private fun failMessage(): String = lastError ?: "Couldn't reach your other devices."

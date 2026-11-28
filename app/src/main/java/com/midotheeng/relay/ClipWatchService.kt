@@ -109,16 +109,6 @@ class ClipWatchService : AccessibilityService() {
                         if (mentionsCopied(t)) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
                     }
                 }
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED, AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                    val t = labelOf(e) + " " + (e.className ?: "").toString().lowercase()
-                    val pane = if (android.os.Build.VERSION.SDK_INT >= 28) e.source?.paneTitle?.toString()?.lowercase() ?: "" else ""
-                    val sys = e.packageName == "com.android.systemui"
-                    if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && sys) note("System window", e, t.trim())
-                    // Android 13+ clipboard preview, snackbars like "Message copied", etc.
-                    if ((sys && (t.contains("clipboard") || pane.contains("clipboard"))) || mentionsCopied(t) || mentionsCopied(pane)) {
-                        trigger(usedSelection = false, where = if (sys) "Android's copied preview" else "“${t.trim().take(30)}” in ${appName(e)}")
-                    }
-                }
                 // Android 13+: the clipboard preview appears as its own window.
                 AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
                     val shown = try {
@@ -164,7 +154,7 @@ class ClipWatchService : AccessibilityService() {
         if (Peers.all().isEmpty()) { AutoLog.add("Copy noticed, but no devices are linked"); return }
         val now = SystemClock.elapsedRealtime()
         if (now - Sync.lastWriteAt < 2500) return // that was us pasting something we received
-        if (now - lastTrigger < 700) return
+        if (now - lastTrigger < 1500) return // one copy = one read (it fires several signals)
         AutoLog.add("Copy noticed: $where")
         lastTrigger = now
         triggerUsedSelection = usedSelection
