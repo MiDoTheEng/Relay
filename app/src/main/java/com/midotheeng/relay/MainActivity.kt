@@ -509,6 +509,12 @@ private fun AutoSendCard() {
             color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
         )
         if (last.isNotEmpty()) Text("Last tap seen: $last", style = MaterialTheme.typography.bodySmall)
+        val signals by AutoLog.signals.collectAsState()
+        if (signals.isNotEmpty()) {
+            Text("Signals seen:", style = MaterialTheme.typography.labelMedium)
+            signals.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+            HorizontalDivider()
+        }
         if (lines.isEmpty()) {
             Text("On ✓  Copy some text in any app, then come back here to see what happened.", style = MaterialTheme.typography.bodyMedium)
         } else {

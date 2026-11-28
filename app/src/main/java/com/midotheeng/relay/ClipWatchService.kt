@@ -64,39 +64,74 @@ class ClipWatchService : AccessibilityService() {
 
     override fun onInterrupt() {}
 
+    private var clipboardWindowShown = false
+
+    private fun isOurNotice(t: String) = t.contains("pasted") || t.contains("relay") || t.contains("لصق")
+
+    private fun mentionsCopied(t: String) = !isOurNotice(t) && COPIED_WORDS.any { t.contains(it) }
+
+    /** Remembers signals that might be a copy, so the app can show what this phone does when you copy. */
+    private fun note(kind: String, e: AccessibilityEvent, label: String) {
+        val l = label.take(30).ifEmpty { "(no label)" }
+        AutoLog.signal("$kind “$l” · ${appName(e)}")
+    }
+
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         e ?: return
         if (e.packageName == packageName) return
         AutoLog.events.value = AutoLog.events.value + 1
-        if (e.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED || e.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
-            val l = labelOf(e).take(30)
-            AutoLog.lastEvent.value = "tap on “${l.ifEmpty { "(no label)" }}” in ${appName(e)}"
-        }
         try {
             when (e.eventType) {
                 AccessibilityEvent.TYPE_VIEW_CLICKED, AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
                     val label = labelOf(e)
+                    AutoLog.lastEvent.value = "tap on “${label.take(30).ifEmpty { "(no label)" }}” in ${appName(e)}"
                     val viewId = try { e.source?.viewIdResourceName?.lowercase() } catch (_: Exception) { null } ?: ""
                     val byId = viewId.endsWith("/copy") || viewId.contains("copy")
                     val byLabel = label.length <= 60 && COPY_WORDS.any {
                         label == it || label.startsWith("$it ") || label.endsWith(" $it") || label.contains(" $it ")
                     }
-                    if (byId || byLabel) trigger(usedSelection = true, where = "tapped “${label.ifEmpty { viewId }}” in ${appName(e)}")
+                    if (byId || byLabel) {
+                        note("Tap", e, label.ifEmpty { viewId })
+                        trigger(usedSelection = true, where = "tapped “${label.ifEmpty { viewId }}” in ${appName(e)}")
+                    }
                 }
+                // Spoken announcements, e.g. Android or an app saying "Copied".
+                AccessibilityEvent.TYPE_ANNOUNCEMENT -> {
+                    val t = labelOf(e)
+                    note("Announcement", e, t)
+                    if (mentionsCopied(t)) trigger(usedSelection = false, where = "“$t” announced by ${appName(e)}")
+                }
+                // Toasts like "Copied to clipboard" / "Link copied".
                 AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
                     if (e.className?.toString()?.contains("Toast") == true) {
                         val t = labelOf(e)
-                        // Ignore Android's own "Relay pasted from your clipboard" notice (that's us reading it).
-                        val ours = t.contains("pasted") || t.contains("relay") || t.contains("لصق")
-                        if (!ours && COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
+                        note("Message", e, t)
+                        if (mentionsCopied(t)) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
                     }
                 }
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                    // Android 13+ shows its own clipboard preview after every copy.
-                    if (e.packageName == "com.android.systemui") {
-                        val t = labelOf(e) + " " + (e.className ?: "").toString().lowercase()
-                        if (t.contains("clipboard") || COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "Android's copied preview")
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED, AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                    val t = labelOf(e) + " " + (e.className ?: "").toString().lowercase()
+                    val pane = if (android.os.Build.VERSION.SDK_INT >= 28) e.source?.paneTitle?.toString()?.lowercase() ?: "" else ""
+                    val sys = e.packageName == "com.android.systemui"
+                    if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && sys) note("System window", e, t.trim())
+                    // Android 13+ clipboard preview, snackbars like "Message copied", etc.
+                    if ((sys && (t.contains("clipboard") || pane.contains("clipboard"))) || mentionsCopied(t) || mentionsCopied(pane)) {
+                        trigger(usedSelection = false, where = if (sys) "Android's copied preview" else "“${t.trim().take(30)}” in ${appName(e)}")
                     }
+                }
+                // Android 13+: the clipboard preview appears as its own window.
+                AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
+                    val shown = try {
+                        windows.any { w ->
+                            val title = w.title?.toString()?.lowercase() ?: ""
+                            title.contains("clipboard") || title.contains("copied")
+                        }
+                    } catch (_: Exception) { false }
+                    if (shown && !clipboardWindowShown) {
+                        AutoLog.signal("Clipboard preview window appeared")
+                        trigger(usedSelection = false, where = "Android's clipboard preview window")
+                    }
+                    clipboardWindowShown = shown
                 }
                 AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
                     val text = e.text?.joinToString("") ?: return

@@ -260,6 +260,15 @@ object AutoLog {
     val connected = MutableStateFlow(false)
     private val fmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
+    /** Recent copy-like signals from other apps (diagnostics). */
+    val signals = MutableStateFlow<List<String>>(emptyList())
+
+    fun signal(msg: String) {
+        val line = fmt.format(java.util.Date()) + "  " + msg
+        if (signals.value.firstOrNull()?.endsWith(msg) == true) return
+        signals.value = (listOf(line) + signals.value).take(6)
+    }
+
     fun add(msg: String) {
         val line = fmt.format(java.util.Date()) + "  " + msg
         lines.value = (listOf(line) + lines.value).take(12)
