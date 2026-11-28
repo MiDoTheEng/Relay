@@ -210,7 +210,12 @@ class RelayService : Service() {
             enabled = { prefs.useInternet },
             since = { prefs.cloudSince },
             saveSince = { prefs.cloudSince = it },
-            onPacket = { h, b, age -> io.execute { onCloudPacket(h, b, age) } },
+            onPacket = { h, b, age ->
+                io.execute {
+                    // Never let one bad message take the whole app down.
+                    try { onCloudPacket(h, b, age) } catch (e: Exception) { Log.w(TAG, "cloud packet", e) }
+                }
+            },
         )
         cloud.start()
         io.execute { tcpLoop() }
@@ -355,7 +360,9 @@ class RelayService : Service() {
                     server = ss
                     while (alive) {
                         val s = ss.accept()
-                        io.execute { handleConnection(s) }
+                        io.execute {
+                            try { handleConnection(s) } catch (e: Exception) { Log.w(TAG, "connection", e) }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -378,7 +385,7 @@ class RelayService : Service() {
     }
 
     private fun onCloudPacket(h: JSONObject, body: ByteArray, ageSec: Long) {
-        val tmp = File.createTempFile("cl", ".part", cacheDir)
+        val tmp = File.createTempFile("relay_cloud", ".part", cacheDir)
         tmp.writeBytes(body)
         dispatch(h, tmp, null, ageSec)
     }
@@ -687,7 +694,7 @@ class RelayService : Service() {
                     .build()
                 try { nm.notify(PROGRESS_ID, progress) } catch (_: Exception) {}
                 // Copy locally first so we know the size and can read it more than once.
-                val cached = File.createTempFile("out", ".bin", cacheDir)
+                val cached = File.createTempFile("relay_out", ".bin", cacheDir)
                 contentResolver.openInputStream(uri)!!.use { i -> cached.outputStream().use { i.copyTo(it) } }
                 val reached = deliverStream(
                     header("file").put("name", meta.name).put("mime", meta.mime), cached.length()

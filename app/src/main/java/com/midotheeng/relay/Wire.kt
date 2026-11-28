@@ -184,7 +184,7 @@ object Wire {
         val size = header.optLong("size", -1)
         if (size < 0) return reject()
 
-        val tmp = File.createTempFile("in", ".part", tmpDir)
+        val tmp = File.createTempFile("relay_in", ".part", tmpDir)
         try {
             FileOutputStream(tmp).use { fo ->
                 val buf = ByteArray(65536)
