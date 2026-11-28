@@ -118,7 +118,7 @@ object Wire {
     const val UDP_PORT = 47832
     private val MAGIC = "RLY2".toByteArray()
 
-    fun send(host: String, keys: Keys, header: JSONObject, body: InputStream, bodyLen: Long, connectTimeout: Int = 2500) {
+    fun send(host: String, keys: Keys, header: JSONObject, body: InputStream, bodyLen: Long, connectTimeout: Int = 800) {
         Socket().use { s ->
             s.connect(InetSocketAddress(host, PORT), connectTimeout)
             s.soTimeout = 20000

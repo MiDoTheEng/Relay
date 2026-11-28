@@ -220,6 +220,7 @@ private fun HomeScreen(prefs: Prefs) {
             item { CrashCard() }
             item { DevicesCard(peers.values.sortedByDescending { it.lastSeen }, now) { showAdd = true } }
             item { ChecklistCard(prefs) }
+            item { AutoSendCard() }
             item {
                 Section("Send") {
                     OutlinedTextField(
@@ -485,6 +486,27 @@ private fun ChecklistCard(prefs: Prefs) {
             Text(c.why, style = MaterialTheme.typography.bodySmall)
             Button(onClick = c.onClick) { Text(c.button) }
             c.extra?.invoke()
+        }
+    }
+}
+
+/** Shows what auto-send did each time you copied, so problems are visible. */
+@Composable
+private fun AutoSendCard() {
+    val ctx = LocalContext.current
+    val tick by resumeTick.collectAsState()
+    val on = remember(tick) { ClipWatchService.isOn(ctx) }
+    val lines by AutoLog.lines.collectAsState()
+    if (!on) return
+    Section("Auto-send activity") {
+        if (lines.isEmpty()) {
+            Text("On ✓  Copy some text in any app, then come back here to see what happened.", style = MaterialTheme.typography.bodyMedium)
+        } else {
+            lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+            Text(
+                "Something not working? Screenshot this card and send it to Claude.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary
+            )
         }
     }
 }

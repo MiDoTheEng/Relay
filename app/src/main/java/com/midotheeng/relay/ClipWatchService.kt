@@ -57,6 +57,7 @@ class ClipWatchService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        AutoLog.add("Auto-send is on and listening")
         RelayService.start(this)
     }
 
@@ -67,23 +68,26 @@ class ClipWatchService : AccessibilityService() {
         if (e.packageName == packageName) return
         try {
             when (e.eventType) {
-                AccessibilityEvent.TYPE_VIEW_CLICKED -> {
+                AccessibilityEvent.TYPE_VIEW_CLICKED, AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
                     val label = labelOf(e)
-                    if (label.length <= 40 && COPY_WORDS.any { label == it || label.startsWith("$it ") || label.endsWith(" $it") }) {
-                        trigger(usedSelection = true)
+                    val viewId = try { e.source?.viewIdResourceName?.lowercase() } catch (_: Exception) { null } ?: ""
+                    val byId = viewId.endsWith("/copy") || viewId.contains("copy")
+                    val byLabel = label.length <= 60 && COPY_WORDS.any {
+                        label == it || label.startsWith("$it ") || label.endsWith(" $it") || label.contains(" $it ")
                     }
+                    if (byId || byLabel) trigger(usedSelection = true, where = "tapped “${label.ifEmpty { viewId }}” in ${appName(e)}")
                 }
                 AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
                     if (e.className?.toString()?.contains("Toast") == true) {
                         val t = labelOf(e)
-                        if (COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false)
+                        if (COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
                     }
                 }
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                     // Android 13+ shows its own clipboard preview after every copy.
                     if (e.packageName == "com.android.systemui") {
                         val t = labelOf(e) + " " + (e.className ?: "").toString().lowercase()
-                        if (t.contains("clipboard") || COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false)
+                        if (t.contains("clipboard") || COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "Android's copied preview")
                     }
                 }
                 AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED -> {
@@ -106,12 +110,19 @@ class ClipWatchService : AccessibilityService() {
 
     private var triggerUsedSelection = false
 
-    private fun trigger(usedSelection: Boolean) {
+    private fun appName(e: AccessibilityEvent): String = try {
+        val pkg = e.packageName?.toString() ?: return "an app"
+        packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+    } catch (_: Exception) { e.packageName?.toString() ?: "an app" }
+
+    private fun trigger(usedSelection: Boolean, where: String) {
         val p = Prefs(this)
-        if (!p.autoSend || Peers.all().isEmpty()) return
+        if (!p.autoSend) { AutoLog.add("Copy noticed ($where), but auto-send is off in Settings"); return }
+        if (Peers.all().isEmpty()) { AutoLog.add("Copy noticed, but no devices are linked"); return }
         val now = SystemClock.elapsedRealtime()
         if (now - Sync.lastWriteAt < 2500) return // that was us pasting something we received
         if (now - lastTrigger < 700) return
+        AutoLog.add("Copy noticed: $where")
         lastTrigger = now
         triggerUsedSelection = usedSelection
         // Give the app a moment to actually put the text on the clipboard.
@@ -161,8 +172,9 @@ class ClipWatchService : AccessibilityService() {
 
     private fun readAndSend() {
         try {
-            ClipActivity.sendClipboard(this, auto = true)
+            AutoLog.add("Read clipboard: " + ClipActivity.sendClipboard(this, auto = true))
         } catch (ex: Exception) {
+            AutoLog.add("Couldn't read clipboard: ${ex.message}")
             Log.w(TAG, "read", ex)
         }
     }
@@ -171,12 +183,14 @@ class ClipWatchService : AccessibilityService() {
     private fun fallback() {
         val sel = lastSelection
         if (triggerUsedSelection && sel != null && SystemClock.elapsedRealtime() - lastSelectionAt < 15_000) {
+            AutoLog.add("Using the selected text instead")
             if (sel != Sync.lastText) {
                 Sync.lastText = sel
                 RelayService.sendText(this, sel, quiet = true)
             }
             return
         }
+        AutoLog.add("Invisible window didn't get focus; trying an invisible screen")
         try {
             startActivity(
                 Intent(this, ClipActivity::class.java).setAction(ClipActivity.ACTION_AUTO)

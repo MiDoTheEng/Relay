@@ -78,30 +78,36 @@ class ClipActivity : Activity() {
          * Reads the clipboard (caller must have focus) and sends it.
          * auto = Universal Clipboard: silent, skips what we just synced, only sends text and images.
          */
-        fun sendClipboard(ctx: Context, auto: Boolean = false) {
+        /** Returns a short description of what happened (shown in the auto-send activity log). */
+        fun sendClipboard(ctx: Context, auto: Boolean = false): String {
             val cm = ctx.getSystemService(ClipboardManager::class.java)
             val clip = try { cm.primaryClip } catch (_: Exception) { null }
-            val item = clip?.takeIf { it.itemCount > 0 }?.getItemAt(0)
+            if (clip == null) {
+                if (!auto) Toast.makeText(ctx, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                return "couldn't read the clipboard"
+            }
+            val item = clip.takeIf { it.itemCount > 0 }?.getItemAt(0)
             val uri = item?.uri
             if (uri != null && item?.text.isNullOrEmpty()) {
                 if (auto) {
                     val mime = try { ctx.contentResolver.getType(uri) } catch (_: Exception) { null }
-                        ?: clip?.description?.takeIf { it.mimeTypeCount > 0 }?.getMimeType(0) ?: ""
-                    if (!mime.startsWith("image/")) return
-                    if (Sync.lastText == "uri:$uri") return
+                        ?: clip.description?.takeIf { it.mimeTypeCount > 0 }?.getMimeType(0) ?: ""
+                    if (!mime.startsWith("image/")) return "copied a file, not sent automatically"
+                    if (Sync.lastText == "uri:$uri") return "same picture as before, skipped"
                 }
                 Sync.lastText = "uri:$uri"
                 RelayService.sendFiles(ctx, listOf(uri), quiet = auto)
-                return
+                return "sending a picture"
             }
             val t = try { item?.coerceToText(ctx)?.toString() } catch (_: Exception) { null }
             if (t.isNullOrEmpty()) {
                 if (!auto) Toast.makeText(ctx, "Clipboard is empty", Toast.LENGTH_SHORT).show()
-                return
+                return "clipboard is empty"
             }
-            if (auto && t == Sync.lastText) return
+            if (auto && t == Sync.lastText) return "same text as before, skipped"
             Sync.lastText = t
             RelayService.sendText(ctx, t, quiet = auto)
+            return "sending “${t.take(30).replace('\n', ' ')}${if (t.length > 30) "…" else ""}”"
         }
     }
 
@@ -148,7 +154,9 @@ class ClipActivity : Activity() {
     private fun grab() {
         if (handled || isFinishing) return
         handled = true
-        sendClipboard(this, auto = intent?.action == ACTION_AUTO)
+        val auto = intent?.action == ACTION_AUTO
+        val r = sendClipboard(this, auto = auto)
+        if (auto) AutoLog.add("Invisible screen: $r")
         close()
     }
 

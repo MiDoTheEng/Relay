@@ -250,3 +250,14 @@ object Sync {
         if (seenMsgs.containsKey(msgId)) false else { seenMsgs[msgId] = now; true }
     }
 }
+
+/** What auto-send did recently, shown in the app so problems are visible. */
+object AutoLog {
+    val lines = MutableStateFlow<List<String>>(emptyList())
+    private val fmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+
+    fun add(msg: String) {
+        val line = fmt.format(java.util.Date()) + "  " + msg
+        lines.value = (listOf(line) + lines.value).take(12)
+    }
+}
