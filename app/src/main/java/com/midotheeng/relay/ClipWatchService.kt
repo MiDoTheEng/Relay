@@ -86,7 +86,9 @@ class ClipWatchService : AccessibilityService() {
                 AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
                     if (e.className?.toString()?.contains("Toast") == true) {
                         val t = labelOf(e)
-                        if (COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
+                        // Ignore Android's own "Relay pasted from your clipboard" notice (that's us reading it).
+                        val ours = t.contains("pasted") || t.contains("relay") || t.contains("لصق")
+                        if (!ours && COPIED_WORDS.any { t.contains(it) }) trigger(usedSelection = false, where = "“$t” message in ${appName(e)}")
                     }
                 }
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
