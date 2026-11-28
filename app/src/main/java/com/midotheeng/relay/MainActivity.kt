@@ -217,6 +217,7 @@ private fun HomeScreen(prefs: Prefs) {
             ),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            item { CrashCard() }
             item { DevicesCard(peers.values.sortedByDescending { it.lastSeen }, now) { showAdd = true } }
             item { ChecklistCard(prefs) }
             item {
@@ -258,6 +259,35 @@ private fun Section(title: String, content: @Composable () -> Unit) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium)
             content()
+        }
+    }
+}
+
+/** Shown after Relay crashed: lets the user copy the details and send them. */
+@Composable
+private fun CrashCard() {
+    val ctx = LocalContext.current
+    val file = remember { java.io.File(ctx.filesDir, "crash.txt") }
+    var report by remember { mutableStateOf(if (file.exists()) file.readText() else null) }
+    val r = report ?: return
+    Card(
+        Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Relay closed unexpectedly last time", style = MaterialTheme.typography.titleMedium)
+            Text("Tap Copy report and paste it to Claude so it can be fixed.", style = MaterialTheme.typography.bodyMedium)
+            Text(r.lines().take(4).joinToString("\n"), style = MaterialTheme.typography.bodySmall, maxLines = 4, overflow = TextOverflow.Ellipsis)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = {
+                    val cm = ctx.getSystemService(android.content.ClipboardManager::class.java)
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("Relay crash", r))
+                    Sync.lastText = r
+                    Sync.lastWriteAt = android.os.SystemClock.elapsedRealtime()
+                    Toast.makeText(ctx, "Report copied", Toast.LENGTH_SHORT).show()
+                }) { Text("Copy report") }
+                TextButton(onClick = { file.delete(); report = null }) { Text("Dismiss") }
+            }
         }
     }
 }
@@ -405,7 +435,7 @@ private fun ChecklistCard(prefs: Prefs) {
         if (isHuawei) {
             list += Check(
                 "Huawei: let Relay start by itself",
-                "In the list, find Relay, turn off “Manage automatically”, and turn on all three switches.",
+                "Settings → Battery → App launch → Relay: turn OFF “Manage automatically”, then turn ON Auto-launch, Secondary launch and Run in background.",
                 sp.getBoolean("huaweiDone", false),
                 "Open", {
                     sp.edit().putBoolean("huaweiDone", true).apply()
@@ -423,7 +453,10 @@ private fun ChecklistCard(prefs: Prefs) {
         }
         list += Check(
             "Send what I copy, automatically",
-            "Turn on “Relay: send what I copy” in Accessibility. Then anything you copy is ready to paste on your other devices.",
+            if (isHuawei)
+                "Settings → Accessibility features → Accessibility → “Relay: send what I copy” → turn on. Then anything you copy is ready to paste on your other devices."
+            else
+                "Settings → Accessibility → (Downloaded apps / Installed apps) → “Relay: send what I copy” → turn on. Then anything you copy is ready to paste on your other devices.",
             ClipWatchService.isOn(ctx),
             "Turn on", {
                 try { ctx.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}

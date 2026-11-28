@@ -26,6 +26,20 @@ class RelayApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // If Relay ever crashes, keep the details so the user can copy them from the app.
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = java.io.StringWriter()
+                e.printStackTrace(java.io.PrintWriter(sw))
+                java.io.File(filesDir, "crash.txt").writeText(
+                    "Relay ${packageManager.getPackageInfo(packageName, 0).versionName} · " +
+                        "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})\n" +
+                        "Thread: ${t.name}\n" + sw.toString().take(6000)
+                )
+            } catch (_: Exception) {}
+            previous?.uncaughtException(t, e)
+        }
         Peers.init(Prefs(this))
         History.init(this)
         val nm = getSystemService(NotificationManager::class.java)
