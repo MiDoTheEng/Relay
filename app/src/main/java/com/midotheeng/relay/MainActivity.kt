@@ -497,8 +497,18 @@ private fun AutoSendCard() {
     val tick by resumeTick.collectAsState()
     val on = remember(tick) { ClipWatchService.isOn(ctx) }
     val lines by AutoLog.lines.collectAsState()
+    val events by AutoLog.events.collectAsState()
+    val last by AutoLog.lastEvent.collectAsState()
+    val connected by AutoLog.connected.collectAsState()
     if (!on) return
     Section("Auto-send activity") {
+        Text(
+            if (connected) "Listening ✓ · $events screen events received" else
+                "The switch is on, but Android hasn't started Relay's listener. Turn “Relay: send what I copy” off and on again.",
+            style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium,
+            color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+        )
+        if (last.isNotEmpty()) Text("Last tap seen: $last", style = MaterialTheme.typography.bodySmall)
         if (lines.isEmpty()) {
             Text("On ✓  Copy some text in any app, then come back here to see what happened.", style = MaterialTheme.typography.bodyMedium)
         } else {

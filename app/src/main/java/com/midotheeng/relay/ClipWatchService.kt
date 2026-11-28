@@ -57,6 +57,7 @@ class ClipWatchService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        AutoLog.connected.value = true
         AutoLog.add("Auto-send is on and listening")
         RelayService.start(this)
     }
@@ -66,6 +67,11 @@ class ClipWatchService : AccessibilityService() {
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         e ?: return
         if (e.packageName == packageName) return
+        AutoLog.events.value = AutoLog.events.value + 1
+        if (e.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED || e.eventType == AccessibilityEvent.TYPE_VIEW_LONG_CLICKED) {
+            val l = labelOf(e).take(30)
+            AutoLog.lastEvent.value = "tap on “${l.ifEmpty { "(no label)" }}” in ${appName(e)}"
+        }
         try {
             when (e.eventType) {
                 AccessibilityEvent.TYPE_VIEW_CLICKED, AccessibilityEvent.TYPE_VIEW_LONG_CLICKED -> {
@@ -207,7 +213,13 @@ class ClipWatchService : AccessibilityService() {
         try { getSystemService(WindowManager::class.java).removeView(v) } catch (_: Exception) {}
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        AutoLog.connected.value = false
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
+        AutoLog.connected.value = false
         removeOverlay()
         super.onDestroy()
     }

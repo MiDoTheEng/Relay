@@ -254,6 +254,10 @@ object Sync {
 /** What auto-send did recently, shown in the app so problems are visible. */
 object AutoLog {
     val lines = MutableStateFlow<List<String>>(emptyList())
+    /** Live proof that Android is passing events to the accessibility service. */
+    val events = MutableStateFlow(0)
+    val lastEvent = MutableStateFlow("")
+    val connected = MutableStateFlow(false)
     private val fmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
 
     fun add(msg: String) {
